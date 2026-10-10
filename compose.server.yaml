@@ -1,0 +1,19 @@
+services:
+  benchmark:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${BENCHMARK_HOST_PORT:-8088}:8088"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      BENCHMARK_PORT: "8088"
+      LITELLM_URL: ${LITELLM_URL:-http://host.docker.internal:4000}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://host.docker.internal:9090}
+      SPENDLOGS_JSONL: /data/spendlogs
+      SPENDLOGS_MANIFEST: ${SPENDLOGS_MANIFEST:-}
+      LITELLM_PROMETHEUS_METRIC: ${LITELLM_PROMETHEUS_METRIC:-litellm_requests_metric}
+      LITELLM_PROMETHEUS_QUERY_TEMPLATE: ${LITELLM_PROMETHEUS_QUERY_TEMPLATE:-}
+    volumes:
+      - ${SPENDLOGS_ARCHIVE_HOST:-./data/spendlogs}:/data/spendlogs:ro

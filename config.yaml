@@ -1,0 +1,20 @@
+model_list: []
+
+general_settings:
+  store_prompts_in_spend_logs: true
+
+litellm_settings:
+  callbacks:
+    - prometheus
+  require_auth_for_metrics_endpoint: false
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    password: os.environ/REDIS_PASSWORD
+
+router_settings:
+  redis_host: redis
+  redis_port: 6379
+  redis_password: os.environ/REDIS_PASSWORD

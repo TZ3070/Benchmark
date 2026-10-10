@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+*.jsonl
+*.manifest.json
+data/spendlogs/
+__pycache__/
+*.py[cod]
+.DS_Store
