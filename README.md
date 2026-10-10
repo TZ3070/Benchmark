@@ -1,71 +1,100 @@
-# LiteLLM Benchmark
+# LiteLLM Benchmark Replay API
 
-LiteLLM 历史流量回放后端：从 SpendLogs JSONL 快照筛选历史请求，按 `startTime` 到达间隔开放环回放到目标 LiteLLM 模型，并提供任务状态与已发送请求数 API。
+按 LiteLLM SpendLogs JSONL 中 `startTime` 的相对间隔，将历史请求开放环回放到目标 LiteLLM 模型。服务提供 HTTP API，不包含前端页面；响应、延迟、token 和错误等结果由 LiteLLM 记录。
 
-## 启动
+## 启动方式
 
-1. 在 `.env` 中设置 compose 需要的 LiteLLM、Postgres 和 Redis 密钥。
-2. 配置 `config.yaml` 中 LiteLLM 可用的 `model_list`。
-3. 准备符合下方格式要求的 JSONL 文件或归档目录；如需指定离散文件，可配置清单。
-4. 运行 `docker compose up --build`。
+以下两种方式都要求：
 
-Benchmark 服务只绑定到本机回环地址。它只读挂载 `LiteLLM_SpendLogs.jsonl`，并通过 LiteLLM Master Key 将回放请求发送到本 compose 中的 LiteLLM。模型调用会产生实际费用或副作用，请在隔离测试环境和可控模型上运行。
+- Python 3.12 或 Docker Engine + Docker Compose 插件（二选一）。
+- 一个可从 Benchmark 服务访问的 LiteLLM Proxy，以及对应的 Master Key。
+- 一个 JSONL 文件或归档目录，其中记录包含 `startTime`、`model` 和可回放请求内容。
+- 可选：可访问的 Prometheus 地址，仅供 `GET /api/series` 使用。
 
-## 部署到已有 LiteLLM 服务器
+### Docker Compose
 
-服务器已经运行 LiteLLM、Postgres 和 Redis 时，使用 `compose.server.yaml`，它只启动 Benchmark 容器，不会再启动或修改这些服务：
+适用于服务器上 LiteLLM、Postgres、Redis 和 Prometheus 已经运行的情况。此 Compose **只启动 Benchmark API**，不会启动或改动其他服务。
 
-1. 将本项目放到服务器，并准备归档目录，例如 `data/spendlogs/`。
-2. 将 `.env.example` 复制为 `.env`，设置 `LITELLM_MASTER_KEY`，并确认容器可通过 `LITELLM_URL` 访问现有 LiteLLM。默认地址 `http://host.docker.internal:4000` 适用于 LiteLLM 在宿主机发布 4000 端口的情况；若服务在其他主机或 Docker 网络，填写从 Benchmark 容器可达的地址。
-3. 把每周导出的全表快照放进归档目录。默认挂载 `./data/spendlogs`；也可通过 `SPENDLOGS_ARCHIVE_HOST` 指定宿主机目录。
-4. 启动：
+1. 将项目放到服务器。创建归档目录并将完整 SpendLogs 快照放入其中：
+
+   ```bash
+   mkdir -p data/spendlogs
+   ```
+
+2. 复制环境变量模板并编辑：
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   设置 `LITELLM_URL`、`LITELLM_MASTER_KEY` 和 `SPENDLOGS_ARCHIVE_HOST`。默认 LiteLLM 地址 `http://host.docker.internal:4000` 适用于宿主机发布了 4000 端口的情况；如果 LiteLLM 在其他主机或 Docker 网络中，填写 Benchmark 容器可访问的地址。
+
+3. 构建并启动：
 
    ```bash
    docker compose --env-file .env -f compose.server.yaml up -d --build
    ```
 
-   查看日志：`docker compose --env-file .env -f compose.server.yaml logs -f benchmark`。
+   查看日志：
 
-若由服务器定时导出全表快照，可运行 `scripts/export_spendlogs_weekly.sh`。脚本默认查找项目内的 `compose.yaml` 和 `postgres` 服务；服务器已有 LiteLLM Compose 时，设置 `LITELLM_COMPOSE_DIR`、可选的 `LITELLM_COMPOSE_FILE` 和 `LITELLM_POSTGRES_SERVICE`，并将 `SPENDLOGS_OUTPUT_DIR` 指向 Benchmark 的归档目录（默认 `data/spendlogs/`）。导出文件名为 UTC ISO 周，如 `2026-W41.jsonl`；同目录会生成校验用 manifest JSON。
+   ```bash
+   docker compose --env-file .env -f compose.server.yaml logs -f benchmark
+   ```
 
-Benchmark API 默认仅绑定服务器的 `127.0.0.1:8088`。远程访问时通过已有的 SSH 隧道或受保护的反向代理接入。`PROMETHEUS_URL` 只影响 `/api/series`；不配置可达的 Prometheus 时，回放接口仍可使用。
+API 默认仅绑定服务器 `127.0.0.1:8088`。远程访问可使用 SSH 隧道或受保护的反向代理。
+
+### Python 直接启动
+
+适用于已有 Python 3.12 的环境。程序只使用 Python 标准库，不需要安装第三方包。
+
+```bash
+export LITELLM_URL=http://你的LiteLLM地址:4000
+export LITELLM_MASTER_KEY=你的LiteLLM密钥
+export SPENDLOGS_JSONL=./data/spendlogs
+export PROMETHEUS_URL=http://你的Prometheus地址:9090  # 可选，仅供 /api/series
+export BENCHMARK_HOST=127.0.0.1  # 默认仅本机访问；远程访问请使用 SSH 隧道/受保护代理
+export BENCHMARK_PORT=8088
+python3 app.py
+```
+
+`SPENDLOGS_JSONL` 可指向单个 `.jsonl` 文件或递归包含多个 `.jsonl` 文件的目录。默认值为项目目录下的 `LiteLLM_SpendLogs.jsonl`。
+
+## 环境变量
+
+| 变量 | 用途 | 默认值 |
+|---|---|---|
+| `LITELLM_URL` | LiteLLM Proxy 地址 | `http://127.0.0.1:4000` |
+| `LITELLM_MASTER_KEY` | 获取目标模型列表并发送回放请求 | 无；必填 |
+| `SPENDLOGS_JSONL` | JSONL 文件或归档目录 | `./LiteLLM_SpendLogs.jsonl` |
+| `SPENDLOGS_MANIFEST` | 可选的 JSONL 文件清单路径 | 无 |
+| `PROMETHEUS_URL` | `/api/series` 查询地址 | `http://127.0.0.1:9090` |
+| `BENCHMARK_PORT` | HTTP API 监听端口 | `8088` |
+| `BENCHMARK_HOST` | HTTP API 监听地址 | `127.0.0.1` |
+| `BENCHMARK_MAX_WORKERS` | 最大并发请求数 | `128` |
+| `LITELLM_PROMETHEUS_METRIC` | Prometheus 指标名称 | `litellm_requests_metric` |
+| `LITELLM_PROMETHEUS_QUERY_TEMPLATE` | 可选 PromQL 模板，支持 `{metric}`、`{model}` | `sum(rate({metric}{model="{model}"}[1m]))` |
+
+Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只读挂载到容器 `/data/spendlogs`，并自动设置容器内 `SPENDLOGS_JSONL`。也可用 `BENCHMARK_HOST_PORT` 修改宿主机绑定的本地端口。
 
 ## HTTP API
 
-- `GET /api/models`：返回 JSONL 中的源模型和 LiteLLM 当前可用目标模型。
+- `GET /api/models`：返回 JSONL 中的源模型和 LiteLLM 当前可用的目标模型。
 - `GET /api/preview?model=...&start=...&end=...`：返回选区记录数、可回放数、缺少请求内容数。时间范围为 `[start,end)`，时间必须带时区。
-- `POST /api/runs`：异步启动回放，返回 `run_id`。可选 `speed` 为正数，默认 `1.0`；调度间隔为原始相对间隔除以 `speed`，例如 `2.0` 表示两倍速，`0.5` 表示半速。
-- `GET /api/runs/{run_id}`：返回 `queued`、`running`、`completed`、`failed` 或 `cancelled` 状态及 `sent_count`。
-- `POST /api/runs/{run_id}/cancel`：请求取消回放；已发出的请求会继续由 LiteLLM 处理。
-- `GET /api/series?model=...&start=...&end=...`：返回 Prometheus 时间序列，供未来 UI 使用。
+- `POST /api/runs`：异步启动回放，返回 `run_id`。可选 `speed` 为正数，默认 `1.0`；调度间隔为原始相对间隔除以 `speed`。
+- `GET /api/runs/{run_id}`：返回任务状态及 `sent_count`。
+- `POST /api/runs/{run_id}/cancel`：请求取消回放；已发送的请求会继续由 LiteLLM 处理。
+- `GET /api/series?model=...&start=...&end=...`：读取 Prometheus 时间序列。
 
-`sent_count` 表示已提交给 HTTP 客户端的请求数，不是已完成响应数。响应、延迟、token、错误等运行指标由 LiteLLM 记录；本工具不生成性能对比报告。
+`sent_count` 表示已提交给 HTTP 客户端的请求数，不是已完成响应数。服务重启后任务历史会丢失。服务没有独立用户认证，应保持本机回环访问或放在受保护的反向代理之后。
 
-## JSONL 格式
+## JSONL 回放规则
 
-每行一个 JSON 对象，至少有 `model`、`startTime`（或 Unix 秒/ISO-8601 格式的 `timestamp`）及一个可回放请求体来源。LiteLLM SpendLogs 导出的无时区 `startTime` 按 UTC 解释：
+每行一个 JSON 对象。至少需要 `model`、`startTime`（或 Unix 秒/ISO-8601 格式的 `timestamp`），以及可还原为请求体的字段。例如：
 
 ```json
 {"request_id":"req-1","model":"source-model","startTime":"2026-10-09T08:23:21.665+00:00","request_body":{"messages":[{"role":"user","content":"hello"}],"temperature":0.2}}
 ```
 
-LiteLLM SpendLogs 顶层的 `proxy_server_request` 也可作为请求体来源；也支持 `request_body`、`request`、`body`、`messages` 或文本 `prompt`。回放保留请求体中已保存的模型参数（如 `temperature`、`top_p`、`max_tokens`），只将 `model` 替换为目标模型；未保存的参数不补默认值。LiteLLM 注入的 `metadata`、内部字段和历史 API 凭证不会转发，请求使用服务端配置的 LiteLLM Master Key。请求须含非空 `messages` 数组。`call_type=anthropic_messages` 会重放到 LiteLLM `/v1/messages`；`acompletion` 会重放到 `/v1/chat/completions`。仅有 token 数、request ID 或响应信息无法还原 prompt，后端会在启动前拒绝该选区。
+可从 `proxy_server_request`、`request_body`、`request`、`body`、`messages` 或文本 `prompt` 读取请求内容。无时区的 LiteLLM `startTime` 按 UTC 解释。回放保留已保存的模型参数（如 `temperature`、`top_p`、`max_tokens`），只替换目标模型；历史凭证、内部字段和 metadata 不会转发。`call_type=anthropic_messages` 使用 `/v1/messages`，`acompletion` 等 Chat Completions 类型使用 `/v1/chat/completions`。
 
-## 配置
-
-- `SPENDLOGS_JSONL`：JSONL 输入文件或归档目录；目录会递归发现 `.jsonl` 文件。每周导出文件名中的 UTC ISO 周（例如 `2026-W41.jsonl`）表示全表快照导出时间，不表示文件只含该周请求。因此回放会读取归档中的所有快照，再按记录时间筛选。Docker Compose 使用 `SPENDLOGS_JSONL_HOST` 指定宿主机文件或目录；服务器部署使用 `SPENDLOGS_ARCHIVE_HOST`。
-- `SPENDLOGS_MANIFEST`：可选的逐行文件清单。相对路径以清单所在目录解析；每行可写一个 `.jsonl` 文件或目录，空行和 `#` 注释行会忽略。Compose 中路径应指向挂载目录内的清单，例如 `/data/spendlogs/files.txt`。
-
-文件清单示例（每行一个相对或绝对路径）：
-
-```text
-2026/week-40.jsonl
-2026/week-41.jsonl
-archive/older-weeks/
-```
-- `PROMETHEUS_URL`、`LITELLM_URL`：compose 内部服务地址。
-- `LITELLM_PROMETHEUS_METRIC`：Prometheus 指标名。
-- `LITELLM_PROMETHEUS_QUERY_TEMPLATE`：PromQL 模板，支持 `{metric}`、`{model}` 占位符。
-- `BENCHMARK_MAX_WORKERS`：最多并发 HTTP 请求数，默认 128。
-
-回放会合并配置的数据源中的快照，按所选 UTC 时间段精确筛选，再按 `(request_id, startTime)` 去重；同一键重复时按文件路径排序保留首次出现的记录。没有 `request_id` 的行不参与去重。回放按相对首条请求的 `startTime` 偏移提交并发请求，不等待前一请求完成；默认 `speed: 1.0`，按原始相对间隔发送。运行状态暂存在服务内存；服务重启后任务历史会丢失。服务未配置独立用户认证，应保持本机回环访问，不要直接暴露到不可信网络。
+回放会根据所选模型与 `[start,end)` 时间范围筛选记录，合并归档快照后按 `(request_id, startTime)` 去重，并按原始相对间隔发出请求。每个服务实例同时只允许一个活动回放任务。

@@ -8,12 +8,14 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 
+# Runtime configuration: point SPENDLOGS_JSONL at a JSONL file or archive
+# directory; LiteLLM is required for target model discovery and request replay.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SPENDLOGS_JSONL = os.environ.get("SPENDLOGS_JSONL", os.path.join(BASE_DIR, "LiteLLM_SpendLogs.jsonl"))
 SPENDLOGS_MANIFEST = os.environ.get("SPENDLOGS_MANIFEST", "")
@@ -21,6 +23,7 @@ PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://127.0.0.1:9090").rstri
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://127.0.0.1:4000").rstrip("/")
 LITELLM_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 PORT = int(os.environ.get("BENCHMARK_PORT", "8088"))
+HOST = os.environ.get("BENCHMARK_HOST", "127.0.0.1")
 MAX_WORKERS = max(1, int(os.environ.get("BENCHMARK_MAX_WORKERS", "128")))
 
 jobs: dict[str, dict] = {}
@@ -332,7 +335,7 @@ def run_replay(run_id: str, source_model: str, target_model: str, start: datetim
             active_runs = False
 
 
-class Handler(SimpleHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
@@ -371,8 +374,7 @@ class Handler(SimpleHTTPRequestHandler):
                     job = jobs.get(run_id)
                 self.send_json(200, job) if job is not None else self.send_json(404, {"error": "run not found"})
             else:
-                self.path = "/index.html"
-                return super().do_GET()
+                self.send_json(404, {"error": "not found"})
         except (ValueError, RuntimeError, URLError, OSError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": str(exc)})
 
@@ -432,5 +434,6 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    Handler.directory = os.path.join(BASE_DIR, "web")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    # API-only HTTP server. Bind address and port are controlled by the host;
+    # use a reverse proxy or SSH tunnel if remote access is required.
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

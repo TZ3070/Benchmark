@@ -1,12 +1,16 @@
 services:
   benchmark:
+    # Starts only this replay API and connects to existing LiteLLM/Prometheus.
     build: .
     restart: unless-stopped
     ports:
+      # Localhost binding avoids exposing the unauthenticated API directly.
       - "127.0.0.1:${BENCHMARK_HOST_PORT:-8088}:8088"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      # The container listens on all interfaces; published host port stays loopback-only.
+      BENCHMARK_HOST: "0.0.0.0"
       BENCHMARK_PORT: "8088"
       LITELLM_URL: ${LITELLM_URL:-http://host.docker.internal:4000}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
@@ -16,4 +20,5 @@ services:
       LITELLM_PROMETHEUS_METRIC: ${LITELLM_PROMETHEUS_METRIC:-litellm_requests_metric}
       LITELLM_PROMETHEUS_QUERY_TEMPLATE: ${LITELLM_PROMETHEUS_QUERY_TEMPLATE:-}
     volumes:
+      # Historical SpendLogs snapshots are read-only input to replay.
       - ${SPENDLOGS_ARCHIVE_HOST:-./data/spendlogs}:/data/spendlogs:ro
