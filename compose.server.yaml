@@ -1,9 +1,10 @@
 services:
   benchmark:
     # Starts only this replay API and connects to existing LiteLLM/Prometheus.
-    # Offline deployment: load litellm-benchmark:latest before starting Compose.
-    image: litellm-benchmark:latest
-    pull_policy: never
+    # Build locally from the preloaded python:3.12-slim base image.
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
       # Localhost binding avoids exposing the unauthenticated API directly.

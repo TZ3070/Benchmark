@@ -29,24 +29,26 @@
 
    设置 `LITELLM_URL`、`LITELLM_MASTER_KEY` 和 `SPENDLOGS_ARCHIVE_HOST`。默认 LiteLLM 地址 `http://host.docker.internal:4000` 适用于宿主机发布了 4000 端口的情况；如果 LiteLLM 在其他主机或 Docker 网络中，填写 Benchmark 容器可访问的地址。
 
-3. 在这台 arm64 Mac 上从项目根目录构建 Linux ARM64 镜像包：
+3. 在这台 arm64 Mac 上拉取与服务器匹配的 Python 3.12 基础镜像并打包：
 
    ```bash
-   docker buildx build --platform linux/arm64 -t litellm-benchmark:latest \
-     --output type=docker,dest=litellm-benchmark-linux-arm64.tar .
+   docker pull --platform linux/arm64 python:3.12-slim
+   docker save -o python-3.12-slim-linux-arm64.tar python:3.12-slim
    ```
 
-   将 `litellm-benchmark-linux-arm64.tar` 传到服务器，并在服务器导入：
+   将 tar 包作为 GitHub Release 附件上传（不要提交到 Git 源码历史），或通过文件传输送到服务器。GitHub Release 的下载需要服务器能访问 GitHub；若服务器离线，请用 `scp` 等方式传输。服务器导入：
 
    ```bash
-   docker load -i litellm-benchmark-linux-arm64.tar
+   docker load -i python-3.12-slim-linux-arm64.tar
    ```
 
-4. 启动。Compose 使用已导入的本地镜像，不构建也不尝试拉取：
+4. Compose 使用本地 Python 基础镜像构建 Benchmark 容器：
 
    ```bash
-   docker compose --env-file .env -f compose.server.yaml up -d
+   docker compose --env-file .env -f compose.server.yaml up -d --build
    ```
+
+   Dockerfile 的 `FROM python:3.12-slim` 与导入的镜像标签一致；`compose.server.yaml` 只定义 `build`，不会尝试拉取 Benchmark 应用镜像。已加载基础镜像且不加 `--pull` 时，Docker 会使用本地基础镜像。
 
    查看日志：
 
