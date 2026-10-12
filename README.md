@@ -6,7 +6,7 @@
 
 以下两种方式都要求：
 
-- Python 3.12 或 Docker Engine + Docker Compose 插件（二选一）。
+- Python 3.10 或更高版本，或 Docker Engine + Docker Compose 插件（二选一）。
 - 一个可从 Benchmark 服务访问的 LiteLLM Proxy，以及对应的 Master Key。
 - 一个 JSONL 文件或归档目录，其中记录包含 `startTime`、`model` 和可回放请求内容。
 - 可选：可访问的 Prometheus 地址，仅供 `GET /api/series` 使用。
@@ -29,10 +29,23 @@
 
    设置 `LITELLM_URL`、`LITELLM_MASTER_KEY` 和 `SPENDLOGS_ARCHIVE_HOST`。默认 LiteLLM 地址 `http://host.docker.internal:4000` 适用于宿主机发布了 4000 端口的情况；如果 LiteLLM 在其他主机或 Docker 网络中，填写 Benchmark 容器可访问的地址。
 
-3. 构建并启动：
+3. 在这台 arm64 Mac 上从项目根目录构建 Linux ARM64 镜像包：
 
    ```bash
-   docker compose --env-file .env -f compose.server.yaml up -d --build
+   docker buildx build --platform linux/arm64 -t litellm-benchmark:latest \
+     --output type=docker,dest=litellm-benchmark-linux-arm64.tar .
+   ```
+
+   将 `litellm-benchmark-linux-arm64.tar` 传到服务器，并在服务器导入：
+
+   ```bash
+   docker load -i litellm-benchmark-linux-arm64.tar
+   ```
+
+4. 启动。Compose 使用已导入的本地镜像，不构建也不尝试拉取：
+
+   ```bash
+   docker compose --env-file .env -f compose.server.yaml up -d
    ```
 
    查看日志：
@@ -45,7 +58,7 @@ API 默认仅绑定服务器 `127.0.0.1:8088`。远程访问可使用 SSH 隧道
 
 ### Python 直接启动
 
-适用于已有 Python 3.12 的环境。程序只使用 Python 标准库，不需要安装第三方包。
+适用于已有 Python 3.10 或更高版本的环境。程序只使用 Python 标准库，不需要安装第三方包。Docker 镜像则使用 Dockerfile 中指定的 Python 3.12。
 
 ```bash
 export LITELLM_URL=http://你的LiteLLM地址:4000
