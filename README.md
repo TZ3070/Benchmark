@@ -6,9 +6,9 @@
 
 以下两种方式都要求：
 
-- Python 3.10 或更高版本，或 Docker Engine + Docker Compose 插件（二选一）。
+- Python 3.10 或更高版本并安装 `requirements.txt`，或 Docker Engine + Docker Compose 插件（二选一）。
 - 一个可从 Benchmark 服务访问的 LiteLLM Proxy，以及对应的 Master Key。
-- 一个 JSONL 文件或归档目录，其中记录包含 `startTime`、`model` 和可回放请求内容。
+- 可访问的 LiteLLM Postgres（`LiteLLM_SpendLogs` 表），以及可选的 JSONL 周归档；数据库保留的数据优先，归档补齐已清理的数据。
 - 可选：可访问的 Prometheus 地址，仅供 `GET /api/series` 使用。
 
 ### Docker Compose
@@ -27,28 +27,28 @@
    cp .env.example .env
    ```
 
-   设置 `LITELLM_URL`、`LITELLM_MASTER_KEY` 和 `SPENDLOGS_ARCHIVE_HOST`。默认 LiteLLM 地址 `http://host.docker.internal:4000` 适用于宿主机发布了 4000 端口的情况；如果 LiteLLM 在其他主机或 Docker 网络中，填写 Benchmark 容器可访问的地址。
+   设置 `LITELLM_URL`、`LITELLM_MASTER_KEY`、Postgres 连接参数和 `SPENDLOGS_ARCHIVE_HOST`。默认 Postgres 地址使用宿主机的 `host.docker.internal:32100`；如果服务在其他主机或 Docker 网络中，填写 Benchmark 容器可访问的地址。
 
-3. 在这台 arm64 Mac 上拉取与服务器匹配的 Python 3.12 基础镜像并打包：
+3. 在可联网的 arm64 Mac 上构建完整 Linux/ARM64 应用镜像（包含 Postgres 驱动）并打包：
 
    ```bash
-   docker pull --platform linux/arm64 python:3.12-slim
-   docker save -o python-3.12-slim-linux-arm64.tar python:3.12-slim
+   docker buildx build --platform linux/arm64 --load -t benchmark-replay:offline .
+   docker save -o benchmark-replay-linux-arm64.tar benchmark-replay:offline
    ```
 
    将 tar 包作为 GitHub Release 附件上传（不要提交到 Git 源码历史），或通过文件传输送到服务器。GitHub Release 的下载需要服务器能访问 GitHub；若服务器离线，请用 `scp` 等方式传输。服务器导入：
 
    ```bash
-   docker load -i python-3.12-slim-linux-arm64.tar
+   docker load -i benchmark-replay-linux-arm64.tar
    ```
 
-4. Compose 使用本地 Python 基础镜像构建 Benchmark 容器：
+4. 启动已导入的 Benchmark 镜像：
 
    ```bash
-   docker compose --env-file .env -f compose.server.yaml up -d --build
+   docker compose --env-file .env -f compose.server.yaml up -d
    ```
 
-   Dockerfile 的 `FROM python:3.12-slim` 与导入的镜像标签一致；`compose.server.yaml` 只定义 `build`，不会尝试拉取 Benchmark 应用镜像。已加载基础镜像且不加 `--pull` 时，Docker 会使用本地基础镜像。
+   `compose.server.yaml` 使用本地 `benchmark-replay:offline` 标签，不会尝试下载应用镜像。
 
    查看日志：
 
@@ -60,11 +60,17 @@ API 默认仅绑定服务器 `127.0.0.1:8088`。远程访问可使用 SSH 隧道
 
 ### Python 直接启动
 
-适用于已有 Python 3.10 或更高版本的环境。程序只使用 Python 标准库，不需要安装第三方包。Docker 镜像则使用 Dockerfile 中指定的 Python 3.12。
+适用于已有 Python 3.10 或更高版本的环境。先安装 Postgres 驱动，再启动服务。Docker 镜像使用 Dockerfile 中指定的 Python 3.12，并在构建时安装相同依赖。
 
 ```bash
+python3 -m pip install -r requirements.txt
 export LITELLM_URL=http://你的LiteLLM地址:4000
 export LITELLM_MASTER_KEY=你的LiteLLM密钥
+export POSTGRES_HOST=127.0.0.1
+export POSTGRES_PORT=32100
+export POSTGRES_DB=litellm
+export POSTGRES_USER=litellm
+export POSTGRES_PASSWORD=你的Postgres密码
 export SPENDLOGS_JSONL=./data/spendlogs
 export PROMETHEUS_URL=http://你的Prometheus地址:9090  # 可选，仅供 /api/series
 export BENCHMARK_HOST=127.0.0.1  # 默认仅本机访问；远程访问请使用 SSH 隧道/受保护代理
@@ -72,7 +78,7 @@ export BENCHMARK_PORT=8088
 python3 app.py
 ```
 
-`SPENDLOGS_JSONL` 可指向单个 `.jsonl` 文件或递归包含多个 `.jsonl` 文件的目录。默认值为项目目录下的 `LiteLLM_SpendLogs.jsonl`。
+`SPENDLOGS_JSONL` 可指向单个 `.jsonl` 文件或递归包含多个 `.jsonl` 文件的目录，用于补齐 Postgres 中已清理的记录。默认值为项目目录下的 `LiteLLM_SpendLogs.jsonl`。
 
 ## 环境变量
 
@@ -80,12 +86,18 @@ python3 app.py
 |---|---|---|
 | `LITELLM_URL` | LiteLLM Proxy 地址 | `http://127.0.0.1:4000` |
 | `LITELLM_MASTER_KEY` | 获取目标模型列表并发送回放请求 | 无；必填 |
+| `POSTGRES_HOST` | LiteLLM Postgres 主机名/IP | `127.0.0.1` |
+| `POSTGRES_PORT` | LiteLLM Postgres 端口 | `32100` |
+| `POSTGRES_DB` | 数据库名 | `litellm` |
+| `POSTGRES_USER` | 数据库用户 | `litellm` |
+| `POSTGRES_PASSWORD` | 数据库密码 | 无 |
 | `SPENDLOGS_JSONL` | JSONL 文件或归档目录 | `./LiteLLM_SpendLogs.jsonl` |
 | `SPENDLOGS_MANIFEST` | 可选的 JSONL 文件清单路径 | 无 |
 | `PROMETHEUS_URL` | `/api/series` 查询地址 | `http://127.0.0.1:9090` |
 | `BENCHMARK_PORT` | HTTP API 监听端口 | `8088` |
 | `BENCHMARK_HOST` | HTTP API 监听地址 | `127.0.0.1` |
 | `BENCHMARK_MAX_WORKERS` | 最大并发请求数 | `128` |
+| `BENCHMARK_RESPONSE_READ_TIMEOUT` | 请求响应读取超时秒数；流式响应持续读取至结束 | `120` |
 | `LITELLM_PROMETHEUS_METRIC` | Prometheus 指标名称 | `litellm_requests_metric` |
 | `LITELLM_PROMETHEUS_QUERY_TEMPLATE` | 可选 PromQL 模板，支持 `{metric}`、`{model}` | `sum(rate({metric}{model="{model}"}[1m]))` |
 
@@ -97,12 +109,15 @@ Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只�
 
 - `GET /api/models`：返回 JSONL 中的源模型和 LiteLLM 当前可用的目标模型。
 - `GET /api/preview?model=...&start=...&end=...`：返回选区记录数、可回放数、缺少请求内容数。时间范围为 `[start,end)`，时间必须带时区。
-- `POST /api/runs`：异步启动回放，返回 `run_id`。可选 `speed` 为正数，默认 `1.0`；调度间隔为原始相对间隔除以 `speed`。
-- `GET /api/runs/{run_id}`：返回任务状态及 `sent_count`。
-- `POST /api/runs/{run_id}/cancel`：请求取消回放；已发送的请求会继续由 LiteLLM 处理。
+- `POST /api/replays`：按前端契约提交 `model_id`、Unix 秒 `start_time`、`end_time`，并发送 `Idempotency-Key`。异步返回 `replay_id`。可选 `speed` 默认 `1.0`。
+- `GET /api/replays/{replay_id}`：返回状态、请求总数、已发送数和已完成数，时间字段为 Unix 秒。
+- 同一时刻只允许一个活动回放任务；已有任务进行中时，新建请求返回 `409`。
+- 后端当前忽略 `Idempotency-Key`，不保证同键重试复用原任务；重试前端应先查询/恢复原任务，避免重复投放。
+- 带 `stream: true` 的历史请求会以流式方式发送。服务持续读取并丢弃响应内容，直到流结束或读取失败，再更新 `completed_count`。
+- 旧版 `/api/runs` 创建/状态路径仍作为兼容别名保留。
 - `GET /api/series?model=...&start=...&end=...`：读取 Prometheus 时间序列。
 
-`sent_count` 表示已提交给 HTTP 客户端的请求数，不是已完成响应数。服务重启后任务历史会丢失。服务没有独立用户认证，应保持本机回环访问或放在受保护的反向代理之后。
+`sent_count` 表示已提交给 HTTP 客户端的请求数；`completed_count` 在完整读取响应、流结束或请求确定失败后增加。服务重启后任务状态会丢失。服务没有独立用户认证，应保持本机回环访问或放在受保护的反向代理之后。
 
 ## JSONL 回放规则
 
@@ -114,4 +129,4 @@ Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只�
 
 可从 `proxy_server_request`、`request_body`、`request`、`body`、`messages` 或文本 `prompt` 读取请求内容。无时区的 LiteLLM `startTime` 按 UTC 解释。回放保留已保存的模型参数（如 `temperature`、`top_p`、`max_tokens`），只替换目标模型；历史凭证、内部字段和 metadata 不会转发。`call_type=anthropic_messages` 使用 `/v1/messages`，`acompletion` 等 Chat Completions 类型使用 `/v1/chat/completions`。
 
-回放会根据所选模型与 `[start,end)` 时间范围筛选记录，合并归档快照后按 `(request_id, startTime)` 去重，并按原始相对间隔发出请求。每个服务实例同时只允许一个活动回放任务。
+回放会根据所选模型与 `[start,end)` 时间范围筛选记录，合并数据库和归档后按 `(request_id, startTime)` 去重，并按原始相对间隔发出请求。每个服务实例同时只允许一个活动回放任务。

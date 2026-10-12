@@ -1,7 +1,9 @@
 FROM python:3.12-slim
-# The service uses only Python's standard library; no pip install step needed.
+# psycopg is required to read LiteLLM SpendLogs from Postgres.
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 # Port 8088 is the API port; configure the published host port in Compose.
 EXPOSE 8088

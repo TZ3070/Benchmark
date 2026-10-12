@@ -9,9 +9,18 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
+
+
+# LiteLLM SpendLogs rows contain provider-specific/dynamic fields, so keep the
+# row open-ended while naming the shapes passed between replay functions.
+SpendLogRecord = dict[str, Any]
+RequestBody = dict[str, Any]
+ReplayRequest = tuple[SpendLogRecord, RequestBody, str]
+Job = dict[str, Any]
 
 
 # Runtime configuration: point SPENDLOGS_JSONL at a JSONL file or archive
@@ -19,14 +28,21 @@ from urllib.request import Request, urlopen
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SPENDLOGS_JSONL = os.environ.get("SPENDLOGS_JSONL", os.path.join(BASE_DIR, "LiteLLM_SpendLogs.jsonl"))
 SPENDLOGS_MANIFEST = os.environ.get("SPENDLOGS_MANIFEST", "")
+POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "127.0.0.1")
+POSTGRES_PORT = int(os.environ.get("POSTGRES_PORT", "32100"))
+POSTGRES_DB = os.environ.get("POSTGRES_DB", "litellm")
+POSTGRES_USER = os.environ.get("POSTGRES_USER", "litellm")
+POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", os.environ.get("PGPASSWORD", ""))
+POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "")
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://127.0.0.1:9090").rstrip("/")
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://127.0.0.1:4000").rstrip("/")
 LITELLM_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 PORT = int(os.environ.get("BENCHMARK_PORT", "8088"))
 HOST = os.environ.get("BENCHMARK_HOST", "127.0.0.1")
 MAX_WORKERS = max(1, int(os.environ.get("BENCHMARK_MAX_WORKERS", "128")))
+RESPONSE_READ_TIMEOUT = max(1.0, float(os.environ.get("BENCHMARK_RESPONSE_READ_TIMEOUT", "120")))
 
-jobs: dict[str, dict] = {}
+jobs: dict[str, Job] = {}
 cancel_events: dict[str, threading.Event] = {}
 jobs_lock = threading.Lock()
 active_runs = False
@@ -42,7 +58,18 @@ def parse_time(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def record_time(record: dict) -> datetime:
+def parse_unix_time(value: Any, field: str) -> datetime:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} 必须是 Unix 秒时间戳")
+    if not (float("-inf") < float(value) < float("inf")):
+        raise ValueError(f"{field} 必须是有限的 Unix 秒时间戳")
+    try:
+        return datetime.fromtimestamp(value, timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(f"{field} 超出有效时间范围") from exc
+
+
+def record_time(record: SpendLogRecord) -> datetime:
     value = record.get("startTime", record.get("timestamp"))
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(value, timezone.utc)
@@ -65,7 +92,7 @@ def record_time(record: dict) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def extract_body(record: dict) -> dict | None:
+def extract_body(record: SpendLogRecord) -> RequestBody | None:
     """Read the archived request body, including LiteLLM proxy_server_request."""
     metadata = record.get("metadata")
     body = next(
@@ -89,8 +116,6 @@ def extract_body(record: dict) -> dict | None:
         return None
     if not isinstance(body.get("messages"), list) or not body["messages"]:
         return None
-    if body.get("stream") is True:
-        return None
     # SpendLogs proxy_server_request can contain LiteLLM-enriched metadata with
     # credentials, old routing state, and IDs. Replay API/model parameters only.
     body = {
@@ -101,7 +126,7 @@ def extract_body(record: dict) -> dict | None:
     return body
 
 
-def endpoint_for_record(record: dict) -> str:
+def endpoint_for_record(record: SpendLogRecord) -> str:
     call_type = str(record.get("call_type", ""))
     if call_type == "anthropic_messages":
         return "/v1/messages"
@@ -123,11 +148,11 @@ def _expand_jsonl_source(path: str) -> list[str]:
     raise RuntimeError(f"JSONL 文件或归档目录不存在: {path}")
 
 
-def jsonl_files() -> list[str]:
+def jsonl_files(required: bool = True) -> list[str]:
     files = []
     if SPENDLOGS_JSONL and os.path.exists(SPENDLOGS_JSONL):
         files.extend(_expand_jsonl_source(SPENDLOGS_JSONL))
-    elif not SPENDLOGS_MANIFEST:
+    elif not SPENDLOGS_MANIFEST and required:
         raise RuntimeError(f"JSONL 文件或归档目录不存在: {SPENDLOGS_JSONL}")
     if SPENDLOGS_MANIFEST:
         manifest = os.path.abspath(os.path.expanduser(SPENDLOGS_MANIFEST))
@@ -144,14 +169,18 @@ def jsonl_files() -> list[str]:
                 except RuntimeError as exc:
                     raise RuntimeError(f"清单第 {line_number} 行: {exc}") from exc
     files = sorted({os.path.realpath(path) for path in files})
-    if not files:
+    if not files and required:
         raise RuntimeError("数据源中没有找到 .jsonl 文件")
     return files
 
 
-def iter_records(start: datetime | None = None, end: datetime | None = None):
-    seen = set()
-    for path in jsonl_files():
+def iter_records(
+    start: datetime | None = None,
+    end: datetime | None = None,
+    allow_empty: bool = False,
+) -> Iterator[SpendLogRecord]:
+    seen: set[tuple[str, datetime]] = set()
+    for path in jsonl_files(required=not allow_empty):
         with open(path, "r", encoding="utf-8") as source:
             for line_number, line in enumerate(source, 1):
                 if not line.strip():
@@ -174,21 +203,133 @@ def iter_records(start: datetime | None = None, end: datetime | None = None):
                 record["_timestamp"] = timestamp
                 record["_line_number"] = line_number
                 record["_source_file"] = path
+                record["_data_source"] = "jsonl"
                 yield record
 
 
-def select_records(model: str, start: datetime, end: datetime) -> list[dict]:
-    selected = []
-    for record in iter_records(start, end):
+def postgres_connect() -> Any:
+    """Connect to the LiteLLM Postgres from the Python host process."""
+    try:
+        import psycopg  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            import psycopg2 as psycopg  # type: ignore[import-not-found,no-redef]
+        except ImportError as exc:
+            raise RuntimeError(
+                "读取 Postgres 需要安装 psycopg（推荐 psycopg[binary]）或 psycopg2；"
+                "当前 Python 环境未安装驱动"
+            ) from exc
+
+    options = {"connect_timeout": 10}
+    if POSTGRES_DSN:
+        return psycopg.connect(POSTGRES_DSN, **options)
+    options.update({
+        "host": POSTGRES_HOST,
+        "port": POSTGRES_PORT,
+        "dbname": POSTGRES_DB,
+        "user": POSTGRES_USER,
+        "password": POSTGRES_PASSWORD or None,
+    })
+    return psycopg.connect(**options)
+
+
+def read_postgres_records(model: str, start: datetime, end: datetime) -> list[SpendLogRecord]:
+    """Fetch complete SpendLogs rows in the requested half-open interval."""
+    connection = None
+    try:
+        connection = postgres_connect()
+        with connection.cursor() as cursor:
+            cursor.execute("SET TIME ZONE 'UTC'")
+            cursor.execute(
+                'SELECT row_to_json(s)::text '
+                'FROM "LiteLLM_SpendLogs" AS s '
+                'WHERE s."model" = %s AND s."startTime" >= %s AND s."startTime" < %s '
+                'ORDER BY s."startTime", s."request_id"',
+                (model, start, end),
+            )
+            records: list[SpendLogRecord] = []
+            for row in cursor:
+                record = json.loads(row[0])
+                if not isinstance(record, dict):
+                    raise RuntimeError('Postgres "LiteLLM_SpendLogs" 返回了非对象行')
+                timestamp = record_time(record)
+                record["_timestamp"] = timestamp
+                record["_data_source"] = "postgres"
+                records.append(record)
+            return records
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Do not include DSN or credentials in diagnostics.
+        raise RuntimeError(
+            f'读取 Postgres "LiteLLM_SpendLogs" 失败 '
+            f"({type(exc).__name__})；请检查数据库连接、凭证和表结构"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def record_identity(record: SpendLogRecord) -> tuple[str, datetime] | None:
+    request_id = record.get("request_id")
+    if request_id is None or not str(request_id).strip():
+        return None
+    return str(request_id), record["_timestamp"]
+
+
+def select_records(model: str, start: datetime, end: datetime) -> list[SpendLogRecord]:
+    # Database rows are authoritative. The weekly JSONL exports only fill keys
+    # that are no longer present in the live 15-day table.
+    merged: dict[tuple[str, datetime], SpendLogRecord] = {}
+    selected_without_id: list[SpendLogRecord] = []
+    for record in read_postgres_records(model, start, end):
+        identity = record_identity(record)
+        if identity is None:
+            selected_without_id.append(record)
+        else:
+            merged[identity] = record
+
+    for record in iter_records(start, end, allow_empty=True):
         if str(record.get("model", "")) != model:
             continue
-        selected.append(record)
-    selected.sort(key=lambda row: (row["_timestamp"], str(row.get("request_id", "")), row["_source_file"]))
+        identity = record_identity(record)
+        if identity is None:
+            selected_without_id.append(record)
+        elif identity not in merged:
+            merged[identity] = record
+
+    selected = [*merged.values(), *selected_without_id]
+    selected.sort(key=lambda row: (
+        row["_timestamp"], str(row.get("request_id", "")),
+        0 if row.get("_data_source") == "postgres" else 1,
+        str(row.get("_source_file", "")),
+    ))
     return selected
 
 
 def query_models() -> list[str]:
-    models = {str(record["model"]) for record in iter_records() if record.get("model") is not None}
+    models = set()
+    connection = None
+    try:
+        connection = postgres_connect()
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT DISTINCT "model" FROM "LiteLLM_SpendLogs" WHERE "model" IS NOT NULL')
+            models.update(str(row[0]) for row in cursor if row[0] is not None)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f'读取 Postgres "LiteLLM_SpendLogs" 模型列表失败 '
+            f"({type(exc).__name__})；请检查数据库连接、凭证和表结构"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    models.update(
+        str(record["model"])
+        for record in iter_records(allow_empty=True)
+        if record.get("model") is not None
+    )
     return sorted(models)
 
 
@@ -211,7 +352,12 @@ def query_target_models() -> list[str]:
     return sorted({str(item["id"]) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")})
 
 
-def prom_query_range(model: str, start: datetime, end: datetime, step: str = "15s") -> dict:
+def prom_query_range(
+    model: str,
+    start: datetime,
+    end: datetime,
+    step: str = "15s",
+) -> dict[str, Any]:
     metric = os.environ.get("LITELLM_PROMETHEUS_METRIC", "litellm_requests_metric")
     if not metric.replace("_", "").isalnum():
         raise ValueError("LITELLM_PROMETHEUS_METRIC must be a Prometheus metric identifier")
@@ -227,79 +373,125 @@ def prom_query_range(model: str, start: datetime, end: datetime, step: str = "15
     return result["data"]
 
 
-def update_job(run_id: str, **values):
+def update_job(run_id: str, **values: Any) -> None:
+    global active_runs
     with jobs_lock:
         job = jobs.get(run_id)
         if job is not None:
             job.update(values)
+            if values.get("status") in ("succeeded", "failed", "cancelled"):
+                active_runs = False
 
 
-def increment_sent(run_id: str):
+def increment_sent(run_id: str) -> None:
     with jobs_lock:
         job = jobs.get(run_id)
         if job is not None:
             job["sent_count"] += 1
 
 
-def run_replay(run_id: str, source_model: str, target_model: str, start: datetime, end: datetime, speed: float):
-    global active_runs
+def increment_completed(run_id: str, failed: bool = False, error: str | None = None) -> None:
+    with jobs_lock:
+        job = jobs.get(run_id)
+        if job is not None:
+            job["completed_count"] += 1
+            if failed:
+                job["failed_count"] += 1
+                job["last_error"] = (error or "请求失败")[:500]
+
+
+def prepare_replay_records(records: list[SpendLogRecord]) -> list[ReplayRequest]:
+    """Materialize and validate the merged requests before dispatch starts."""
+    if not records:
+        raise RuntimeError("选定时间段内没有可回放请求")
+    prepared: list[ReplayRequest] = []
+    missing: list[str] = []
+    for record in records:
+        body = extract_body(record)
+        if body is None:
+            missing.append(record.get("request_id") or record.get("_source_file") or "未知记录")
+            continue
+        try:
+            endpoint = endpoint_for_record(record)
+        except RuntimeError as exc:
+            missing.append(f"{record.get('request_id') or '未知请求'}: {exc}")
+            continue
+        prepared.append((record, body, endpoint))
+    if missing:
+        preview = "、".join(map(str, missing[:3]))
+        more = f" 等 {len(missing)} 条" if len(missing) > 3 else ""
+        raise RuntimeError(
+            f"选中 {len(records)} 条记录，其中 {len(missing)} 条缺少可回放的 request/messages 内容 "
+            f"或使用不支持的 call_type（例如 {preview}{more}）。"
+            "请确保 SpendLogs 行包含 proxy_server_request 或完整 request_body。"
+        )
+    return prepared
+
+
+def run_replay(
+    run_id: str,
+    target_model: str,
+    prepared: list[ReplayRequest],
+    speed: float,
+) -> None:
     try:
-        records = select_records(source_model, start, end)
-        if not records:
-            raise RuntimeError("选定时间段内没有可回放请求")
-        prepared = []
-        missing = []
-        for record in records:
-            body = extract_body(record)
-            if body is None:
-                missing.append(record.get("request_id") or f"{record['_source_file']} 第 {record['_line_number']} 行")
-                continue
-            try:
-                endpoint = endpoint_for_record(record)
-            except RuntimeError as exc:
-                missing.append(f"{record.get('request_id')}: {exc}")
-                continue
-            prepared.append((record, body, endpoint))
-        if missing:
-            preview = "、".join(map(str, missing[:3]))
-            more = f" 等 {len(missing)} 条" if len(missing) > 3 else ""
-            raise RuntimeError(
-                f"选中 {len(records)} 条记录，其中 {len(missing)} 条缺少可回放的 request/messages 内容（例如 {preview}{more}）。"
-                "SpendLogs 元数据行不能还原原始 prompt；请确保 JSONL 保存 proxy_server_request 或完整 request_body。"
-            )
+        if not prepared:
+            raise RuntimeError("没有准备好的回放请求")
         if not LITELLM_API_KEY:
             raise RuntimeError("LITELLM_MASTER_KEY 未配置，无法调用目标 LiteLLM")
 
         cancel_event = cancel_events[run_id]
         t0 = time.monotonic()
-        wall_start = datetime.now(timezone.utc)
         first = prepared[0][0]["_timestamp"]
-        update_job(run_id, status="running", total=len(prepared), started_at=wall_start.isoformat())
+        update_job(run_id, request_count=len(prepared))
+        if cancel_event.is_set():
+            update_job(run_id, status="cancelled", finished_at=time.time())
+            return
 
-        def send_one(record: dict, body: dict, endpoint: str, planned: datetime):
+        def send_one(
+            record: SpendLogRecord,
+            body: RequestBody,
+            endpoint: str,
+            planned: datetime,
+        ) -> None:
             # sent_count represents requests handed to the HTTP client, not replies.
-            request_body = dict(body)
-            request_body["model"] = target_model
-            request = Request(
-                f"{LITELLM_URL}{endpoint}",
-                data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {LITELLM_API_KEY}",
-                    "Content-Type": "application/json",
-                    **({"anthropic-version": "2023-06-01"} if endpoint == "/v1/messages" else {}),
-                },
-                method="POST",
-            )
-            increment_sent(run_id)
+            failed = False
+            error_text = None
             try:
-                with urlopen(request, timeout=120) as response:
-                    if response.status >= 400:
-                        raise RuntimeError(f"LiteLLM 返回 HTTP {response.status}")
+                request_body = dict(body)
+                request_body["model"] = target_model
+                request = Request(
+                    f"{LITELLM_URL}{endpoint}",
+                    data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {LITELLM_API_KEY}",
+                        "Content-Type": "application/json",
+                        **({"anthropic-version": "2023-06-01"} if endpoint == "/v1/messages" else {}),
+                    },
+                    method="POST",
+                )
+                with urlopen(request, timeout=RESPONSE_READ_TIMEOUT) as response:
+                    # Consume the entire body, including SSE streams. A stream is
+                    # complete only after EOF; response content is intentionally
+                    # discarded because the replay service does not proxy it.
+                    read_chunk = getattr(response, "read1", response.read)
+                    while read_chunk(64 * 1024):
+                        pass
             except HTTPError as exc:
-                raise RuntimeError(f"LiteLLM 返回 HTTP {exc.code}: {exc.read().decode(errors='replace')[:300]}") from exc
+                failed = True
+                error_text = f"LiteLLM 返回 HTTP {exc.code}: {exc.read(300).decode(errors='replace')}"
+                raise RuntimeError(error_text) from exc
+            except Exception as exc:
+                failed = True
+                error_text = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                increment_completed(run_id, failed=failed, error=error_text)
 
         executor = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(prepared)))
         futures = []
+        dispatch_started = False
+        dispatch_epoch = None
         try:
             for record, body, endpoint in prepared:
                 if cancel_event.is_set():
@@ -308,11 +500,25 @@ def run_replay(run_id: str, source_model: str, target_model: str, start: datetim
                 delay = offset - (time.monotonic() - t0)
                 if delay > 0 and cancel_event.wait(delay):
                     break
-                scheduled = wall_start.timestamp() + offset
-                planned = datetime.fromtimestamp(scheduled, timezone.utc)
+                if cancel_event.is_set():
+                    break
+                if not dispatch_started:
+                    dispatch_started = True
+                    dispatch_epoch = time.time()
+                    update_job(
+                        run_id,
+                        status="running",
+                        started_at=dispatch_epoch,
+                    )
+                assert dispatch_epoch is not None
+                planned = datetime.fromtimestamp(dispatch_epoch + offset, timezone.utc)
+                increment_sent(run_id)
                 futures.append(executor.submit(send_one, record, body, endpoint, planned))
-                update_job(run_id, last_scheduled_at=planned.isoformat())
-            update_job(run_id, dispatch_finished=True)
+                update_job(run_id, last_scheduled_at=planned.timestamp())
+            if not cancel_event.is_set():
+                update_job(run_id, status="draining", dispatch_finished=True)
+            else:
+                update_job(run_id, dispatch_finished=True)
             errors = []
             for future in futures:
                 try:
@@ -321,25 +527,45 @@ def run_replay(run_id: str, source_model: str, target_model: str, start: datetim
                     errors.append(str(exc))
                     update_job(run_id, error_count=len(errors), last_error=str(exc)[:500])
             if cancel_event.is_set():
-                update_job(run_id, status="cancelled", finished_at=datetime.now(timezone.utc).isoformat())
+                update_job(run_id, status="cancelled", finished_at=time.time())
             elif errors:
-                update_job(run_id, status="failed", error=f"{len(errors)} 个请求发送失败", finished_at=datetime.now(timezone.utc).isoformat())
+                update_job(run_id, status="failed", error=f"{len(errors)} 个请求发送失败", finished_at=time.time())
             else:
-                update_job(run_id, status="completed", finished_at=datetime.now(timezone.utc).isoformat())
+                update_job(run_id, status="succeeded", finished_at=time.time())
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
     except Exception as exc:
-        update_job(run_id, status="failed", error=str(exc), finished_at=datetime.now(timezone.utc).isoformat())
-    finally:
+        update_job(run_id, status="failed", error=str(exc), finished_at=time.time())
+
+
+def prepare_and_run(run_id: str, source_model: str, target_model: str, start: datetime, end: datetime, speed: float) -> None:
+    """Load and merge all source records off the HTTP request thread."""
+    try:
+        records = select_records(source_model, start, end)
+        prepared = prepare_replay_records(records)
+        if cancel_events[run_id].is_set():
+            update_job(run_id, request_count=len(prepared), total=len(prepared), status="cancelled", finished_at=time.time())
+            return
+        if target_model not in query_target_models():
+            raise RuntimeError("目标模型当前未在 LiteLLM 中配置或不可用")
         with jobs_lock:
-            active_runs = False
+            job = jobs.get(run_id)
+            if job is None:
+                return
+            if cancel_events[run_id].is_set():
+                job.update(request_count=len(prepared), total=len(prepared), status="cancelled", finished_at=time.time())
+                return
+            job.update(request_count=len(prepared), total=len(prepared), status="queued")
+        run_replay(run_id, target_model, prepared, speed)
+    except Exception as exc:
+        update_job(run_id, status="failed", error=str(exc), finished_at=time.time())
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
+    def log_message(self, fmt: str, *args: Any) -> None:
         return
 
-    def send_json(self, status, payload):
+    def send_json(self, status: int, payload: Any) -> None:
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         # Keep the HTTP reason phrase ASCII/Latin-1 safe. Error details belong
         # in the UTF-8 JSON body, not in the status line.
@@ -350,7 +576,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):
+    @staticmethod
+    def public_job(job: Job) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "replay_id": job["run_id"],
+            "status": job["status"],
+            "sent_count": job["sent_count"],
+            "completed_count": job["completed_count"],
+            "failed_count": job["failed_count"],
+            "target": {"metrics_labels": {"model_name": job["target_model"]}},
+        }
+        if job.get("request_count") is not None:
+            result["request_count"] = job["request_count"]
+        if job.get("started_at") is not None:
+            result["started_at"] = job["started_at"]
+        if job.get("finished_at") is not None:
+            result["finished_at"] = job["finished_at"]
+        if job.get("error"):
+            result["error"] = job["error"][:500]
+        return result
+
+    def do_GET(self) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         try:
@@ -368,39 +614,50 @@ class Handler(BaseHTTPRequestHandler):
                 model = params.get("model", [""])[0]
                 start, end = parse_time(params.get("start", [""])[0]), parse_time(params.get("end", [""])[0])
                 self.send_json(200, prom_query_range(model, start, end))
-            elif parsed.path.startswith("/api/runs/"):
+            elif parsed.path.startswith("/api/replays/") or parsed.path.startswith("/api/runs/"):
                 run_id = parsed.path.rsplit("/", 1)[-1]
                 with jobs_lock:
                     job = jobs.get(run_id)
-                self.send_json(200, job) if job is not None else self.send_json(404, {"error": "run not found"})
+                    snapshot = dict(job) if job is not None else None
+                self.send_json(200, self.public_job(snapshot)) if snapshot is not None else self.send_json(404, {"error": "replay not found"})
             else:
                 self.send_json(404, {"error": "not found"})
         except (ValueError, RuntimeError, URLError, OSError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": str(exc)})
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         global active_runs
         path = urlparse(self.path).path
         try:
-            if path.startswith("/api/runs/") and path.endswith("/cancel"):
+            if (path.startswith("/api/runs/") or path.startswith("/api/replays/")) and path.endswith("/cancel"):
                 run_id = path.split("/")[-2]
                 with jobs_lock:
                     job = jobs.get(run_id)
                     if job is None:
-                        return self.send_json(404, {"error": "run not found"})
-                    if job["status"] not in ("queued", "running"):
+                        return self.send_json(404, {"error": "replay not found"})
+                    if job["status"] not in ("queued", "preparing", "running", "draining"):
                         return self.send_json(409, {"error": f"run is {job['status']}"})
                     job["status"] = "cancelling"
                     cancel_events[run_id].set()
-                return self.send_json(202, {"run_id": run_id, "status": "cancelling"})
-            if path != "/api/runs":
+                return self.send_json(202, {"replay_id": run_id, "status": "cancelling"})
+            if path not in ("/api/runs", "/api/replays"):
                 return self.send_json(404, {"error": "not found"})
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > 1_000_000:
                 raise ValueError("请求体不能为空且不得超过 1 MB")
             data = json.loads(self.rfile.read(length))
-            source_model, target_model = str(data["source_model"]), str(data["target_model"])
-            start, end = parse_time(data["start"]), parse_time(data["end"])
+            if not isinstance(data, dict):
+                raise ValueError("请求体必须是 JSON 对象")
+            model_id = str(data["model_id"])
+            source_model = model_id
+            target_model = model_id
+            if "start_time" in data and "end_time" in data:
+                start = parse_unix_time(data["start_time"], "start_time")
+                end = parse_unix_time(data["end_time"], "end_time")
+            else:
+                # Keep the previous local API usable while the frontend moves
+                # to the documented Unix-seconds contract.
+                start, end = parse_time(data["start"]), parse_time(data["end"])
             try:
                 speed = float(data.get("speed", 1.0))
             except (TypeError, ValueError) as exc:
@@ -409,26 +666,35 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("speed 必须是大于 0 的有限数字")
             if not source_model or not target_model or start >= end:
                 raise ValueError("请提供有效模型和时间范围")
-            records = select_records(source_model, start, end)
-            if not records:
-                raise ValueError("选定时间段内没有可回放请求")
-            if any(extract_body(row) is None for row in records):
-                raise ValueError("所选 JSONL 记录缺少可回放的 request/proxy_server_request 内容，或属于流式请求")
-            if target_model not in query_target_models():
-                raise ValueError("目标模型当前未在 LiteLLM 中配置或不可用")
             with jobs_lock:
                 if active_runs:
-                    raise ValueError("已有回放任务处于活动状态，请等待任务完成或失败后再启动")
-                active_runs = True
+                    self.send_json(409, {"error": "已有回放任务处于活动状态，请等待任务结束后再启动"})
+                    return
                 run_id = str(uuid.uuid4())
+                active_runs = True
                 cancel_events[run_id] = threading.Event()
                 jobs[run_id] = {
-                    "run_id": run_id, "status": "queued", "source_model": source_model,
-                    "target_model": target_model, "start": start.isoformat(), "end": end.isoformat(),
-                    "speed": speed, "total": len(records), "sent_count": 0, "error_count": 0,
+                    "run_id": run_id,
+                    "status": "preparing",
+                    "source_model": source_model,
+                    "target_model": target_model,
+                    "start": start.timestamp(),
+                    "end": end.timestamp(),
+                    "speed": speed,
+                    "request_count": None,
+                    "sent_count": 0,
+                    "completed_count": 0,
+                    "failed_count": 0,
                 }
-            threading.Thread(target=run_replay, args=(run_id, source_model, target_model, start, end, speed), daemon=True).start()
-            self.send_json(202, {"run_id": run_id, "status": "queued", "total": len(records), "speed": speed})
+                initial_response = self.public_job(dict(jobs[run_id]))
+            threading.Thread(
+                target=prepare_and_run,
+                args=(run_id, source_model, target_model, start, end, speed),
+                daemon=True,
+            ).start()
+            self.send_json(202, initial_response)
+        except KeyError as exc:
+            self.send_json(400, {"error": f"缺少必填字段: {exc.args[0]}"})
         except (KeyError, ValueError, RuntimeError, json.JSONDecodeError, URLError, OSError) as exc:
             self.send_json(400, {"error": str(exc)})
 
