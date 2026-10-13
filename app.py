@@ -267,6 +267,52 @@ def postgres_error_detail(exc: Exception) -> str:
     return detail[:300]
 
 
+def sanitize_upstream_error_body(raw: bytes) -> str:
+    """Keep a bounded, readable upstream error while masking credentials."""
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+
+    sensitive_keys = {
+        "authorization", "apikey", "password", "token", "secret",
+        "accesstoken", "refreshtoken", "clientsecret", "privatekey",
+    }
+
+    def sanitize_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: "[REDACTED]"
+                if re.sub(r"[^a-z0-9]", "", str(key).lower()) in sensitive_keys
+                else sanitize_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [sanitize_value(item) for item in value]
+        if isinstance(value, str):
+            value = re.sub(r"(?i)\bBearer\s+[^\s\"',]+", "Bearer [REDACTED]", value)
+            value = re.sub(r"(?i)\bsk-[A-Za-z0-9_-]{8,}", "[REDACTED_KEY]", value)
+            value = re.sub(
+                r"(?i)(api[_-]?key|authorization|password|access[_-]?token|refresh[_-]?token|client[_-]?secret)\s*[:=]\s*([^\s,;]+)",
+                r"\1=[REDACTED]",
+                value,
+            )
+            for secret in (LITELLM_API_KEY, POSTGRES_PASSWORD):
+                if secret:
+                    value = value.replace(secret, "[REDACTED]")
+            return value
+        return value
+
+    if payload is not None:
+        text = json.dumps(sanitize_value(payload), ensure_ascii=False)
+    else:
+        text = sanitize_value(text)
+    return text[:3000]
+
+
 def read_postgres_records(model: str, start: datetime, end: datetime) -> list[SpendLogRecord]:
     """Fetch complete SpendLogs rows in the requested half-open interval."""
     connection = None
@@ -635,8 +681,10 @@ def run_replay(
                 status_code = exc.code
                 try:
                     error_body = exc.read(64 * 1024)
-                    error_body.decode("utf-8", errors="replace")
+                    detail = sanitize_upstream_error_body(error_body)
                     error_text = f"Upstream returned HTTP {exc.code}"
+                    if detail:
+                        error_text += f": {detail}"
                 except Exception:
                     error_text = f"Upstream returned HTTP {exc.code}"
             except Exception as exc:
