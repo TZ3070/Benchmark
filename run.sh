@@ -22,4 +22,4 @@ set -a
 set +a
 
 cd "$SCRIPT_DIR"
-exec python3 "$SCRIPT_DIR/app.py" "$@"
+exec python3 -m benchmark.app "$@"

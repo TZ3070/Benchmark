@@ -4,7 +4,7 @@
 
 ## 后端结构
 
-- `app.py`：服务启动入口，只负责绑定 `BENCHMARK_HOST` / `BENCHMARK_PORT` 并启动 HTTP server。
+- `benchmark/app.py`：服务启动入口，只负责绑定 `BENCHMARK_HOST` / `BENCHMARK_PORT` 并启动 HTTP server；在项目根目录通过 `python3 -m benchmark.app` 启动。
 - `benchmark/api.py`：HTTP 路由、Bearer 认证、请求校验及响应序列化；这里是前端 `/api/*` 请求的直接入口。
 - `benchmark/core.py`：SpendLogs 查询与 JSONL 回退、回放调度、LiteLLM 请求转发、任务持久化等后端业务。
 - 前端由独立的 TrafficReplay 项目维护；本仓库不包含前端代码。Prometheus 看板接口暂不属于这次回放 API 结构调整范围。
@@ -15,7 +15,7 @@ Vite 开发代理把浏览器的 `/api/*` 原样转发至本服务。`/api/model
 
 以下两种方式都要求：
 
-- Python 3.10 或更高版本并安装 `requirements.txt`，或 Docker Engine + Docker Compose 插件（二选一）。
+- Python 3.10 或更高版本并安装 `dependencies/requirements.txt`，或 Docker Engine + Docker Compose 插件（二选一）。
 - 一个可从 Benchmark 服务访问的 LiteLLM Proxy，以及对应的 Master Key。
 - 可访问的 LiteLLM Postgres（`LiteLLM_SpendLogs` 表），以及可选的 JSONL 周归档；数据库保留的数据优先，归档补齐已清理的数据。
 - 可选：可访问的 Prometheus 地址，仅供 `GET /api/series` 使用。
@@ -69,29 +69,29 @@ API 默认仅绑定服务器 `127.0.0.1:8088`。远程访问可使用 SSH 隧道
 
 ### Python 直接启动
 
-适用于已有 Python 3.10 或更高版本的环境。`run.sh` 会加载项目目录下的 `.env`，再启动 `app.py`，无需手动 export：
+适用于已有 Python 3.10 或更高版本的环境。`run.sh` 会加载项目目录下的 `.env`，再启动 `benchmark` 模块，无需手动 export：
 
 ```bash
 chmod +x run.sh
 ./run.sh
 ```
 
-`.env` 使用 shell 兼容的 `KEY=value` 格式。`app.py` 不设运行配置默认值，所有表格中的变量都必须写入 `.env`；仅当变量用途不需要时，才可将注明可留空的变量显式设为空值。脚本默认读取项目目录下的 `.env`；也可以通过 `BENCHMARK_ENV_FILE=/path/to/env ./run.sh` 指定其他文件。不要把含密钥的 `.env` 上传到 GitHub。
+`.env` 使用 shell 兼容的 `KEY=value` 格式。后端不设运行配置默认值，所有表格中的变量都必须写入 `.env`；仅当变量用途不需要时，才可将注明可留空的变量显式设为空值。脚本默认读取项目目录下的 `.env`；也可以通过 `BENCHMARK_ENV_FILE=/path/to/env ./run.sh` 指定其他文件。不要把含密钥的 `.env` 上传到 GitHub。
 
-正常联网安装时，可使用 `python3 -m pip install -r requirements.txt` 安装依赖。服务器无法联网时，可下载仓库中的 `psycopg-linux-aarch64-cp310.tar.gz` 离线 wheel 包；此包适用于 Linux ARM64、CPython 3.10，无需创建虚拟环境。
+正常联网安装时，可使用 `python3 -m pip install -r dependencies/requirements.txt` 安装依赖。离线安装文件和 wheel 包统一放在 `dependencies/`；其中的 psycopg wheel 包适用于 Linux ARM64、CPython 3.10，无需创建虚拟环境。
 
 #### Linux ARM64 / Python 3.10 离线安装（系统 Python，无虚拟环境）
 
-从 GitHub 下载 `psycopg-linux-aarch64-cp310.tar.gz`，或通过其他文件传输方式将压缩包放到服务器。解压后，用系统 Python 安装到当前解释器：
+通过文件传输将 `dependencies/offline-wheels/psycopg-linux-aarch64-cp310.tar.gz` 放到服务器。解压后，用系统 Python 安装到当前解释器：
 
 ```bash
 mkdir -p psycopg-wheels
-tar -xzf psycopg-linux-aarch64-cp310.tar.gz -C psycopg-wheels
+tar -xzf dependencies/offline-wheels/psycopg-linux-aarch64-cp310.tar.gz -C psycopg-wheels
 python3 -m pip install --no-index --find-links=./psycopg-wheels --user 'psycopg[binary]==3.2.13'
 python3 -c 'import psycopg; print(psycopg.__version__)'
 ```
 
-若服务器的 pip 禁止对系统 Python 执行安装（externally-managed-environment），由管理员按服务器发行版的方式安装这些本地 wheel，或在确认接受系统级 pip 安装后使用该发行版支持的 override 选项。不要用 `sudo pip` 覆盖系统管理的 Python 包。安装后，用同一个 `python3` 执行 `app.py`。该 wheel 包只适用于 Linux ARM64、CPython 3.10；其他架构或 Python 版本须准备对应 wheel。
+若服务器的 pip 禁止对系统 Python 执行安装（externally-managed-environment），由管理员按服务器发行版的方式安装这些本地 wheel，或在确认接受系统级 pip 安装后使用该发行版支持的 override 选项。不要用 `sudo pip` 覆盖系统管理的 Python 包。安装后，用同一个 `python3` 执行 `./run.sh`。该 wheel 包只适用于 Linux ARM64、CPython 3.10；其他架构或 Python 版本须准备对应 wheel。
 
 `SPENDLOGS_JSONL` 可指向单个 `.jsonl` 文件或递归包含多个 `.jsonl` 文件的目录，用于补齐 Postgres 中已清理的记录。路径相对项目目录解析。
 
