@@ -60,7 +60,7 @@ API 默认仅绑定服务器 `127.0.0.1:8088`。远程访问可使用 SSH 隧道
 
 ### Python 直接启动
 
-适用于已有 Python 3.10 或更高版本的环境。先安装 Postgres 驱动，再启动服务。Docker 镜像使用 Dockerfile 中指定的 Python 3.12，并在构建时安装相同依赖。
+适用于已有 Python 3.10 或更高版本的环境。正常联网安装时，可以直接使用 pip 安装依赖。服务器无法联网时，可使用仓库 GitHub Release 中的 `psycopg-linux-aarch64-cp310.zip` 离线 wheel 包；此包适用于 Linux ARM64、CPython 3.10，无需创建虚拟环境。
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -77,6 +77,18 @@ export BENCHMARK_HOST=127.0.0.1  # 默认仅本机访问；远程访问请使用
 export BENCHMARK_PORT=8088
 python3 app.py
 ```
+
+#### Linux ARM64 / Python 3.10 离线安装（系统 Python，无虚拟环境）
+
+从 GitHub Release 下载并解压 `psycopg-linux-aarch64-cp310.zip`，或通过其他文件传输方式将压缩包放到服务器。进入解压目录后，用系统 Python 安装到当前解释器：
+
+```bash
+unzip psycopg-linux-aarch64-cp310.zip -d psycopg-wheels
+python3 -m pip install --no-index --find-links=./psycopg-wheels --user 'psycopg[binary]==3.2.13'
+python3 -c 'import psycopg; print(psycopg.__version__)'
+```
+
+若服务器的 pip 禁止对系统 Python 执行安装（externally-managed-environment），由管理员按服务器发行版的方式安装这些本地 wheel，或在确认接受系统级 pip 安装后使用该发行版支持的 override 选项。不要用 `sudo pip` 覆盖系统管理的 Python 包。安装后，用同一个 `python3` 执行 `app.py`。该 wheel 包只适用于 Linux ARM64、CPython 3.10；其他架构或 Python 版本须准备对应 wheel。
 
 `SPENDLOGS_JSONL` 可指向单个 `.jsonl` 文件或递归包含多个 `.jsonl` 文件的目录，用于补齐 Postgres 中已清理的记录。默认值为项目目录下的 `LiteLLM_SpendLogs.jsonl`。
 
@@ -97,7 +109,7 @@ python3 app.py
 | `BENCHMARK_PORT` | HTTP API 监听端口 | `8088` |
 | `BENCHMARK_HOST` | HTTP API 监听地址 | `127.0.0.1` |
 | `BENCHMARK_MAX_WORKERS` | 最大并发请求数 | `128` |
-| `BENCHMARK_RESPONSE_READ_TIMEOUT` | 请求响应读取超时秒数；流式响应持续读取至结束 | `120` |
+| `BENCHMARK_RESPONSE_READ_TIMEOUT` | 请求响应读取超时秒数；流式响应持续读取至结束 | `600` |
 | `LITELLM_PROMETHEUS_METRIC` | Prometheus 指标名称 | `litellm_requests_metric` |
 | `LITELLM_PROMETHEUS_QUERY_TEMPLATE` | 可选 PromQL 模板，支持 `{metric}`、`{model}` | `sum(rate({metric}{model="{model}"}[1m]))` |
 
@@ -110,14 +122,14 @@ Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只�
 - `GET /api/models`：返回 JSONL 中的源模型和 LiteLLM 当前可用的目标模型。
 - `GET /api/preview?model=...&start=...&end=...`：返回选区记录数、可回放数、缺少请求内容数。时间范围为 `[start,end)`，时间必须带时区。
 - `POST /api/replays`：按前端契约提交 `model_id`、Unix 秒 `start_time`、`end_time`，并发送 `Idempotency-Key`。异步返回 `replay_id`。可选 `speed` 默认 `1.0`。
-- `GET /api/replays/{replay_id}`：返回状态、请求总数、已发送数和已完成数，时间字段为 Unix 秒。
+- `GET /api/replays/{replay_id}`：返回状态、请求总数、已发送数、已完成数、`skipped_count` 和逐请求 `results`，时间字段为 Unix 秒。每条结果包含 `request_id`、`elapsed_seconds`、`input_tokens`、`output_tokens`、`status_code`、`output`，失败时带英文 `error`。
 - 同一时刻只允许一个活动回放任务；已有任务进行中时，新建请求返回 `409`。
 - 后端当前忽略 `Idempotency-Key`，不保证同键重试复用原任务；重试前端应先查询/恢复原任务，避免重复投放。
-- 带 `stream: true` 的历史请求会以流式方式发送。服务持续读取并丢弃响应内容，直到流结束或读取失败，再更新 `completed_count`。
+- 带 `stream: true` 的历史请求会以流式方式发送。服务持续读取响应至 EOF，提取输出文本与 usage，再更新 `completed_count`。
 - 旧版 `/api/runs` 创建/状态路径仍作为兼容别名保留。
 - `GET /api/series?model=...&start=...&end=...`：读取 Prometheus 时间序列。
 
-`sent_count` 表示已提交给 HTTP 客户端的请求数；`completed_count` 在完整读取响应、流结束或请求确定失败后增加。服务重启后任务状态会丢失。服务没有独立用户认证，应保持本机回环访问或放在受保护的反向代理之后。
+`sent_count` 表示已提交给 HTTP 客户端的请求数；`completed_count` 在完整读取响应、流结束或请求确定失败后增加。非流式和流式响应的文本输出会保存在每条结果的 `output` 中，token 数只在上游返回 usage 时填写。无法提取请求体或不支持 endpoint 的记录会跳过；全部跳过时任务失败。Postgres 查询出错时记录 warning 并改用 JSONL。服务重启后任务状态会丢失。服务没有独立用户认证，应保持本机回环访问或放在受保护的反向代理之后。
 
 ## JSONL 回放规则
 
@@ -129,4 +141,4 @@ Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只�
 
 可从 `proxy_server_request`、`request_body`、`request`、`body`、`messages` 或文本 `prompt` 读取请求内容。无时区的 LiteLLM `startTime` 按 UTC 解释。回放保留已保存的模型参数（如 `temperature`、`top_p`、`max_tokens`），只替换目标模型；历史凭证、内部字段和 metadata 不会转发。`call_type=anthropic_messages` 使用 `/v1/messages`，`acompletion` 等 Chat Completions 类型使用 `/v1/chat/completions`。
 
-回放会根据所选模型与 `[start,end)` 时间范围筛选记录，合并数据库和归档后按 `(request_id, startTime)` 去重，并按原始相对间隔发出请求。每个服务实例同时只允许一个活动回放任务。
+回放会根据所选模型与 `[start,end)` 时间范围筛选记录，合并数据库和归档后按 `request_id` 单键去重，并按原始相对间隔发出请求。Anthropic Messages endpoint 优先根据请求体顶层的 `system`、`thinking`、`context_management` 字段判断，再参考 `call_type`。每个服务实例同时只允许一个活动回放任务。
