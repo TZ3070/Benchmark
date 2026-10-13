@@ -126,14 +126,28 @@ Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只�
 
 - `GET /api/models`：返回 JSONL 中的源模型和 LiteLLM 当前可用的目标模型。
 - `GET /api/time-range`：返回 SpendLogs 的 `min`、`max`、`count` 和数据来源；Postgres 不可用时从 JSONL 计算。
+- `GET /api/replays/active`：返回当前活动任务；有任务时为 `{"active":true,"task":{...}}`，无任务时为 `{"active":false,"task":null}`。`/api/runs/active` 为兼容别名。
 - `GET /api/preview?model=...&start=...&end=...`：返回选区记录数、可回放数、缺少请求内容数，以及可选的 `warnings`。时间范围为 `[start,end)`，时间必须带时区。
 - `POST /api/replays`：按前端契约提交 `model_id`、Unix 秒 `start_time`、`end_time`，并发送必需的 `Idempotency-Key`。新任务异步返回 `202` 与 `replay_id`；重复请求返回原任务。
 - `GET /api/replays/{replay_id}`：返回状态、请求总数、已发送数、已完成数、`skipped_count`、`warnings` 和逐请求 `results`，时间字段为 Unix 秒。每条结果包含 `request_id`、`elapsed_seconds`、`input_tokens`、`output_tokens`、`status_code`、`output`，失败时带英文 `error`；上游 HTTP 错误会附带经过脱敏且最多 3,000 字符的响应体摘要。
+- `POST /api/replays/{replay_id}/cancel`：请求取消任务。接受时返回 `202` 与当前任务对象，状态为 `cancelling`；重复请求仍返回 `202`。任务已结束时返回 `409` 和最终 `task`，任务 ID 不存在时返回 `404`。旧版 `/api/runs/{id}/cancel` 也可用。
+- 创建响应和状态响应都包含 `progress`：`ready` 表示总数已经计算完成；`total` 是可回放请求总数；`sent`、`completed`、`skipped` 分别是已发出、已完成和跳过数量；`sent_percent` 和 `percent` 分别表示发送与完成百分比。准备阶段还会返回 `selected_count`（当前筛选出的 SpendLogs 行数）。总数尚未计算完成时，`progress.total` 和百分比为 `null`，前端可继续轮询状态接口。
 - 同一时刻只允许一个活动回放任务；已有任务进行中时，新建请求返回 `409`。
+- 活动任务导致创建返回 `409` 时，响应同时包含 `active_task`，其结构与状态查询响应相同，便于调用方恢复当前任务展示。
 - 相同 `Idempotency-Key` 和请求内容始终复用原任务，包括任务结束或服务重启后；同键不同请求内容返回 `409`。不同键启动时若已有活动任务，也返回 `409`。
 - 带 `stream: true` 的历史请求会以流式方式发送。服务持续读取响应至 EOF，提取输出文本与 usage，再更新 `completed_count`。
 - 旧版 `/api/runs` 创建/状态路径仍作为兼容别名保留；兼容请求可传 `source_model`、`target_model`、ISO-8601 `start`、`end`，当前前端契约使用 `model_id` 与 Unix 秒 `start_time`、`end_time`。
 - `GET /api/series?model=...&start=...&end=...`：读取 Prometheus 时间序列。
+
+### 前端接入待办（由前端项目实现）
+
+以下仅定义前端接入要求；本仓库不包含前端代码。
+
+1. 页面加载时带 `Authorization: Bearer <BENCHMARK_API_KEY>` 请求 `GET /api/replays/active`。若 `active` 为 `true`，用 `task.replay_id` 恢复当前任务并继续轮询 `GET /api/replays/{id}`。
+2. 创建回放时继续发送 `Idempotency-Key`。若收到 `409` 且响应含 `active_task`，接管该任务并展示状态，不要再次创建任务。
+3. 轮询状态时读取 `progress.ready`、`progress.total`、`progress.sent`、`progress.completed`、`progress.sent_percent` 和 `progress.percent`。`ready=false` 时显示正在准备；就绪后显示总请求数和发送/完成进度。也可展示 `selected_count` 与 `skipped_count`。
+4. 活动任务显示“取消”按钮，仅在 `cancellable=true` 时启用。点击后带相同认证头调用 `POST /api/replays/{id}/cancel`，接受 `202` 后继续轮询，直到 `cancelled` 等终态；不要在 `cancelling` 时立即清除任务。
+5. 取消会阻止后续尚未按计划提交的请求。已提交给请求工作线程的请求无法撤回，仍可能完成；因此 `cancelling` 到 `cancelled` 之间可能有延迟，期间计数仍会变化。
 
 `sent_count` 表示已提交给 HTTP 客户端的请求数；`completed_count` 在完整读取响应、流结束或请求确定失败后增加。非流式和流式响应的文本输出会保存在每条结果的 `output` 中，token 数只在上游返回 usage 时填写。无法提取请求体或不支持 endpoint 的记录会跳过；全部跳过时任务失败。Postgres 查询出错时服务记录包含原因的 warning，脱敏后通过 `warnings` 返回，并改用 JSONL；数据库凭证等秘密不会写入 warning。任务和幂等键保存在 `BENCHMARK_STATE_DB` 指定的 SQLite 文件中；服务重启后保留终态任务，重启时仍处于活动状态的任务会标记失败且不会自动续跑。状态文件包含任务结果，需限制其文件访问权限并纳入持久化备份。`/api/replays`、任务状态、取消、预览和序列接口需要 `Authorization: Bearer <BENCHMARK_API_KEY>`；为兼容当前未附认证头的前端只读请求，`/api/models` 和 `/api/time-range` 暂不要求认证。请将密钥作为私密配置，不要放入前端构建变量。API 仍应保持内网可达或放在 HTTPS 反向代理之后。
 

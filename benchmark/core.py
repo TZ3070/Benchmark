@@ -134,12 +134,15 @@ def register_job(job: Job, idempotency_key: str, request_fingerprint: str) -> tu
                 return "existing", existing_job
 
             active = connection.execute(
-                "SELECT run_id FROM replay_jobs WHERE status IN ('queued','preparing','running','draining','cancelling') LIMIT 1"
+                "SELECT run_id, job_json FROM replay_jobs "
+                "WHERE status IN ('queued','preparing','running','draining','cancelling') LIMIT 1"
             ).fetchone()
             if active is not None:
                 connection.commit()
                 active_runs = True
-                return "active", None
+                active_job = json.loads(active["job_json"])
+                jobs[active["run_id"]] = active_job
+                return "active", active_job
 
             now = time.time()
             connection.execute(
@@ -943,20 +946,34 @@ def run_replay(
 def prepare_and_run(run_id: str, source_model: str, target_model: str, start: datetime, end: datetime, speed: float) -> None:
     """Load and merge all source records off the HTTP request thread."""
     try:
+        if cancel_events[run_id].is_set():
+            update_job(run_id, status="cancelled", finished_at=time.time())
+            return
         diagnostics: list[str] = []
         records = select_records(source_model, start, end, diagnostics)
-        if diagnostics:
-            update_job(run_id, warnings=diagnostics)
+        update_job(run_id, selected_count=len(records), warnings=diagnostics)
+        if cancel_events[run_id].is_set():
+            update_job(run_id, status="cancelled", finished_at=time.time())
+            return
         try:
             prepared, skipped_count = prepare_replay_records(records)
         except NoReplayableRequestsError as exc:
-            update_job(run_id, request_count=0, skipped_count=exc.skipped_count)
+            update_job(
+                run_id,
+                request_count=0,
+                skipped_count=exc.skipped_count,
+                preparation_phase="complete",
+            )
+            if cancel_events[run_id].is_set():
+                update_job(run_id, status="cancelled", finished_at=time.time())
+                return
             raise
         update_job(
             run_id,
             request_count=len(prepared),
             skipped_count=skipped_count,
             total=len(prepared),
+            preparation_phase="complete",
         )
         if cancel_events[run_id].is_set():
             update_job(run_id, status="cancelled", finished_at=time.time())
