@@ -251,6 +251,22 @@ def postgres_connect() -> Any:
     return psycopg.connect(**options)
 
 
+def postgres_error_detail(exc: Exception) -> str:
+    """Return useful database diagnostics while redacting connection secrets."""
+    detail = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    detail = re.sub(r"(?i)(password\s*=\s*)[^\s]+", r"\1[REDACTED]", detail)
+    detail = re.sub(
+        r"(?i)(postgres(?:ql)?://[^:/@\s]+:)[^@/\s]+(@)",
+        r"\1[REDACTED]\2",
+        detail,
+    )
+    if POSTGRES_PASSWORD:
+        detail = detail.replace(POSTGRES_PASSWORD, "[REDACTED]")
+    if POSTGRES_DSN:
+        detail = detail.replace(POSTGRES_DSN, "[REDACTED_DSN]")
+    return detail[:300]
+
+
 def read_postgres_records(model: str, start: datetime, end: datetime) -> list[SpendLogRecord]:
     """Fetch complete SpendLogs rows in the requested half-open interval."""
     connection = None
@@ -278,10 +294,11 @@ def read_postgres_records(model: str, start: datetime, end: datetime) -> list[Sp
     except RuntimeError:
         raise
     except Exception as exc:
-        # Do not include DSN or credentials in diagnostics.
+        # Keep the driver's useful reason (e.g. password authentication failed)
+        # while redacting any connection secrets before it reaches logs/API.
         raise RuntimeError(
             f'Failed to read Postgres "LiteLLM_SpendLogs" '
-            f"({type(exc).__name__}); check the database connection, credentials, and schema"
+            f"({type(exc).__name__}: {postgres_error_detail(exc)})"
         ) from exc
     finally:
         if connection is not None:
@@ -298,7 +315,12 @@ def record_identity(record: SpendLogRecord) -> str | None:
     return str(request_id).strip()
 
 
-def select_records(model: str, start: datetime, end: datetime) -> list[SpendLogRecord]:
+def select_records(
+    model: str,
+    start: datetime,
+    end: datetime,
+    diagnostics: list[str] | None = None,
+) -> list[SpendLogRecord]:
     # Database rows are authoritative. The weekly JSONL exports only fill keys
     # that are no longer present in the live 15-day table.
     merged: dict[str, SpendLogRecord] = {}
@@ -306,10 +328,16 @@ def select_records(model: str, start: datetime, end: datetime) -> list[SpendLogR
     try:
         postgres_records = read_postgres_records(model, start, end)
     except Exception as exc:
-        logger.warning(
-            "Postgres SpendLogs query failed; falling back to JSONL only (%s)",
-            type(exc).__name__,
+        warning = (
+            "Postgres SpendLogs query failed; using JSONL only "
+            f"({type(exc).__name__}): {postgres_error_detail(exc)}"
         )
+        logger.warning(
+            "%s",
+            warning,
+        )
+        if diagnostics is not None:
+            diagnostics.append(warning)
         postgres_records = []
 
     for record in postgres_records:
@@ -343,8 +371,9 @@ def query_models() -> list[str]:
             models.update(str(row[0]) for row in cursor if row[0] is not None)
     except Exception as exc:
         logger.warning(
-            'Postgres model lookup failed; using JSONL models only (%s)',
+            'Postgres model lookup failed; using JSONL models only (%s: %s)',
             type(exc).__name__,
+            postgres_error_detail(exc),
         )
     finally:
         if connection is not None:
@@ -680,7 +709,10 @@ def run_replay(
 def prepare_and_run(run_id: str, source_model: str, target_model: str, start: datetime, end: datetime, speed: float) -> None:
     """Load and merge all source records off the HTTP request thread."""
     try:
-        records = select_records(source_model, start, end)
+        diagnostics: list[str] = []
+        records = select_records(source_model, start, end, diagnostics)
+        if diagnostics:
+            update_job(run_id, warnings=diagnostics)
         try:
             prepared, skipped_count = prepare_replay_records(records)
         except NoReplayableRequestsError as exc:
@@ -735,6 +767,7 @@ class Handler(BaseHTTPRequestHandler):
             "failed_count": job["failed_count"],
             "skipped_count": job.get("skipped_count", 0),
             "results": list(job.get("results", [])),
+            "warnings": list(job.get("warnings", [])),
             "target": {"metrics_labels": {"model_name": job["target_model"]}},
         }
         if job.get("request_count") is not None:
@@ -758,9 +791,15 @@ class Handler(BaseHTTPRequestHandler):
                 start, end = parse_time(params.get("start", [""])[0]), parse_time(params.get("end", [""])[0])
                 if not model or start >= end:
                     raise ValueError("A model and valid time range are required")
-                rows = select_records(model, start, end)
+                warnings: list[str] = []
+                rows = select_records(model, start, end, warnings)
                 replayable = sum(extract_body(row) is not None for row in rows)
-                self.send_json(200, {"count": len(rows), "replayable_count": replayable, "missing_payload_count": len(rows) - replayable})
+                self.send_json(200, {
+                    "count": len(rows),
+                    "replayable_count": replayable,
+                    "missing_payload_count": len(rows) - replayable,
+                    "warnings": warnings,
+                })
             elif parsed.path == "/api/series":
                 model = params.get("model", [""])[0]
                 start, end = parse_time(params.get("start", [""])[0]), parse_time(params.get("end", [""])[0])

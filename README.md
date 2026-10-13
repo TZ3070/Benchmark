@@ -121,16 +121,16 @@ Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只�
 ## HTTP API
 
 - `GET /api/models`：返回 JSONL 中的源模型和 LiteLLM 当前可用的目标模型。
-- `GET /api/preview?model=...&start=...&end=...`：返回选区记录数、可回放数、缺少请求内容数。时间范围为 `[start,end)`，时间必须带时区。
+- `GET /api/preview?model=...&start=...&end=...`：返回选区记录数、可回放数、缺少请求内容数，以及可选的 `warnings`。时间范围为 `[start,end)`，时间必须带时区。
 - `POST /api/replays`：按前端契约提交 `model_id`、Unix 秒 `start_time`、`end_time`，并发送 `Idempotency-Key`。异步返回 `replay_id`。可选 `speed` 默认 `1.0`。
-- `GET /api/replays/{replay_id}`：返回状态、请求总数、已发送数、已完成数、`skipped_count` 和逐请求 `results`，时间字段为 Unix 秒。每条结果包含 `request_id`、`elapsed_seconds`、`input_tokens`、`output_tokens`、`status_code`、`output`，失败时带英文 `error`。
+- `GET /api/replays/{replay_id}`：返回状态、请求总数、已发送数、已完成数、`skipped_count`、`warnings` 和逐请求 `results`，时间字段为 Unix 秒。每条结果包含 `request_id`、`elapsed_seconds`、`input_tokens`、`output_tokens`、`status_code`、`output`，失败时带英文 `error`。
 - 同一时刻只允许一个活动回放任务；已有任务进行中时，新建请求返回 `409`。
 - 后端当前忽略 `Idempotency-Key`，不保证同键重试复用原任务；重试前端应先查询/恢复原任务，避免重复投放。
 - 带 `stream: true` 的历史请求会以流式方式发送。服务持续读取响应至 EOF，提取输出文本与 usage，再更新 `completed_count`。
 - 旧版 `/api/runs` 创建/状态路径仍作为兼容别名保留。
 - `GET /api/series?model=...&start=...&end=...`：读取 Prometheus 时间序列。
 
-`sent_count` 表示已提交给 HTTP 客户端的请求数；`completed_count` 在完整读取响应、流结束或请求确定失败后增加。非流式和流式响应的文本输出会保存在每条结果的 `output` 中，token 数只在上游返回 usage 时填写。无法提取请求体或不支持 endpoint 的记录会跳过；全部跳过时任务失败。Postgres 查询出错时记录 warning 并改用 JSONL。服务重启后任务状态会丢失。服务没有独立用户认证，应保持本机回环访问或放在受保护的反向代理之后。
+`sent_count` 表示已提交给 HTTP 客户端的请求数；`completed_count` 在完整读取响应、流结束或请求确定失败后增加。非流式和流式响应的文本输出会保存在每条结果的 `output` 中，token 数只在上游返回 usage 时填写。无法提取请求体或不支持 endpoint 的记录会跳过；全部跳过时任务失败。Postgres 查询出错时服务记录包含原因的 warning，脱敏后通过 `warnings` 返回，并改用 JSONL；数据库凭证等秘密不会写入 warning。服务重启后任务状态会丢失。服务没有独立用户认证，应保持本机回环访问或放在受保护的反向代理之后。
 
 ## JSONL 回放规则
 
