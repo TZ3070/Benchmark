@@ -60,23 +60,16 @@ API 默认仅绑定服务器 `127.0.0.1:8088`。远程访问可使用 SSH 隧道
 
 ### Python 直接启动
 
-适用于已有 Python 3.10 或更高版本的环境。正常联网安装时，可以直接使用 pip 安装依赖。服务器无法联网时，可下载仓库中的 `psycopg-linux-aarch64-cp310.tar.gz` 离线 wheel 包；此包适用于 Linux ARM64、CPython 3.10，无需创建虚拟环境。
+适用于已有 Python 3.10 或更高版本的环境。`run.sh` 会加载项目目录下的 `.env`，再启动 `app.py`，无需手动 export：
 
 ```bash
-python3 -m pip install -r requirements.txt
-export LITELLM_URL=http://你的LiteLLM地址:4000
-export LITELLM_MASTER_KEY=你的LiteLLM密钥
-export POSTGRES_HOST=127.0.0.1
-export POSTGRES_PORT=32100
-export POSTGRES_DB=litellm
-export POSTGRES_USER=litellm
-export POSTGRES_PASSWORD=你的Postgres密码
-export SPENDLOGS_JSONL=./data/spendlogs
-export PROMETHEUS_URL=http://你的Prometheus地址:9090  # 可选，仅供 /api/series
-export BENCHMARK_HOST=127.0.0.1  # 默认仅本机访问；远程访问请使用 SSH 隧道/受保护代理
-export BENCHMARK_PORT=8088
-python3 app.py
+chmod +x run.sh
+./run.sh
 ```
+
+`.env` 使用 shell 兼容的 `KEY=value` 格式。`app.py` 不设运行配置默认值，所有表格中的变量都必须写入 `.env`；仅当变量用途不需要时，才可将注明可留空的变量显式设为空值。脚本默认读取项目目录下的 `.env`；也可以通过 `BENCHMARK_ENV_FILE=/path/to/env ./run.sh` 指定其他文件。不要把含密钥的 `.env` 上传到 GitHub。
+
+正常联网安装时，可使用 `python3 -m pip install -r requirements.txt` 安装依赖。服务器无法联网时，可下载仓库中的 `psycopg-linux-aarch64-cp310.tar.gz` 离线 wheel 包；此包适用于 Linux ARM64、CPython 3.10，无需创建虚拟环境。
 
 #### Linux ARM64 / Python 3.10 离线安装（系统 Python，无虚拟环境）
 
@@ -91,28 +84,26 @@ python3 -c 'import psycopg; print(psycopg.__version__)'
 
 若服务器的 pip 禁止对系统 Python 执行安装（externally-managed-environment），由管理员按服务器发行版的方式安装这些本地 wheel，或在确认接受系统级 pip 安装后使用该发行版支持的 override 选项。不要用 `sudo pip` 覆盖系统管理的 Python 包。安装后，用同一个 `python3` 执行 `app.py`。该 wheel 包只适用于 Linux ARM64、CPython 3.10；其他架构或 Python 版本须准备对应 wheel。
 
-`SPENDLOGS_JSONL` 可指向单个 `.jsonl` 文件或递归包含多个 `.jsonl` 文件的目录，用于补齐 Postgres 中已清理的记录。默认值为项目目录下的 `LiteLLM_SpendLogs.jsonl`。
+`SPENDLOGS_JSONL` 可指向单个 `.jsonl` 文件或递归包含多个 `.jsonl` 文件的目录，用于补齐 Postgres 中已清理的记录。路径相对项目目录解析。
 
 ## 环境变量
 
-| 变量 | 用途 | 默认值 |
+| 变量 | 用途 | 要求 |
 |---|---|---|
-| `LITELLM_URL` | LiteLLM Proxy 地址 | `http://127.0.0.1:4000` |
-| `LITELLM_MASTER_KEY` | 获取目标模型列表并发送回放请求 | 无；必填 |
-| `POSTGRES_HOST` | LiteLLM Postgres 主机名/IP | `127.0.0.1` |
-| `POSTGRES_PORT` | LiteLLM Postgres 端口 | `32100` |
-| `POSTGRES_DB` | 数据库名 | `litellm` |
-| `POSTGRES_USER` | 数据库用户 | `litellm` |
-| `POSTGRES_PASSWORD` | 数据库密码 | 无 |
-| `SPENDLOGS_JSONL` | JSONL 文件或归档目录 | `./LiteLLM_SpendLogs.jsonl` |
-| `SPENDLOGS_MANIFEST` | 可选的 JSONL 文件清单路径 | 无 |
-| `PROMETHEUS_URL` | `/api/series` 查询地址 | `http://127.0.0.1:9090` |
-| `BENCHMARK_PORT` | HTTP API 监听端口 | `8088` |
-| `BENCHMARK_HOST` | HTTP API 监听地址 | `127.0.0.1` |
-| `BENCHMARK_MAX_WORKERS` | 最大并发请求数 | `128` |
-| `BENCHMARK_RESPONSE_READ_TIMEOUT` | 请求响应读取超时秒数；流式响应持续读取至结束 | `600` |
-| `LITELLM_PROMETHEUS_METRIC` | Prometheus 指标名称 | `litellm_requests_metric` |
-| `LITELLM_PROMETHEUS_QUERY_TEMPLATE` | 可选 PromQL 模板，支持 `{metric}`、`{model}` | `sum(rate({metric}{model="{model}"}[1m]))` |
+| `LITELLM_URL` | LiteLLM Proxy 地址 | 必填 |
+| `LITELLM_MASTER_KEY` | 获取目标模型列表并发送回放请求 | 必填 |
+| `POSTGRES_DSN` | 可选的完整连接串；使用独立字段时显式留空 | 必填，可留空 |
+| `POSTGRES_HOST`、`POSTGRES_PORT` | LiteLLM Postgres 地址 | 必填 |
+| `POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD` | Postgres 数据库凭证；密码可为空 | 必填，密码可留空 |
+| `SPENDLOGS_JSONL` | JSONL 文件或归档目录 | 必填 |
+| `SPENDLOGS_MANIFEST` | 可选的 JSONL 文件清单路径 | 必填，可留空 |
+| `PROMETHEUS_URL` | `/api/series` 查询地址 | 必填 |
+| `BENCHMARK_PORT`、`BENCHMARK_HOST` | HTTP API 监听端口和地址 | 必填 |
+| `BENCHMARK_MAX_WORKERS` | 最大并发请求数 | 必填 |
+| `BENCHMARK_RESPONSE_READ_TIMEOUT` | 请求响应读取超时秒数；流式响应持续读取至结束 | 必填 |
+| `LITELLM_PROMETHEUS_METRIC` | Prometheus 指标名称 | 必填 |
+| `LITELLM_PROMETHEUS_QUERY_TEMPLATE` | PromQL 模板，支持 `{metric}`、`{model}` | 必填 |
+| `LITELLM_PROMETHEUS_STEP` | Prometheus 查询步长，例如 `15s` | 必填 |
 
 Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只读挂载到容器 `/data/spendlogs`，并自动设置容器内 `SPENDLOGS_JSONL`。也可用 `BENCHMARK_HOST_PORT` 修改宿主机绑定的本地端口。
 

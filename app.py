@@ -24,24 +24,36 @@ ReplayRequest = tuple[SpendLogRecord, RequestBody, str]
 Job = dict[str, Any]
 
 
-# Runtime configuration: point SPENDLOGS_JSONL at a JSONL file or archive
-# directory; LiteLLM is required for target model discovery and request replay.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SPENDLOGS_JSONL = os.environ.get("SPENDLOGS_JSONL", os.path.join(BASE_DIR, "LiteLLM_SpendLogs.jsonl"))
-SPENDLOGS_MANIFEST = os.environ.get("SPENDLOGS_MANIFEST", "")
-POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "127.0.0.1")
-POSTGRES_PORT = int(os.environ.get("POSTGRES_PORT", "32100"))
-POSTGRES_DB = os.environ.get("POSTGRES_DB", "litellm")
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "litellm")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", os.environ.get("PGPASSWORD", ""))
-POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "")
-PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://127.0.0.1:9090").rstrip("/")
-LITELLM_URL = os.environ.get("LITELLM_URL", "http://127.0.0.1:4000").rstrip("/")
-LITELLM_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
-PORT = int(os.environ.get("BENCHMARK_PORT", "8088"))
-HOST = os.environ.get("BENCHMARK_HOST", "127.0.0.1")
-MAX_WORKERS = max(1, int(os.environ.get("BENCHMARK_MAX_WORKERS", "128")))
-RESPONSE_READ_TIMEOUT = max(1.0, float(os.environ.get("BENCHMARK_RESPONSE_READ_TIMEOUT", "600")))
+def required_env(name: str, allow_empty: bool = False) -> str:
+    if name not in os.environ:
+        raise RuntimeError(f"Required environment variable {name} is not set")
+    value = os.environ[name]
+    if not allow_empty and not value.strip():
+        raise RuntimeError(f"Required environment variable {name} is empty")
+    return value
+
+
+# All runtime configuration must be declared in the environment (run.sh loads
+# the project's .env). Optional values must still be present and explicitly
+# empty when unused.
+SPENDLOGS_JSONL = required_env("SPENDLOGS_JSONL")
+SPENDLOGS_MANIFEST = required_env("SPENDLOGS_MANIFEST", allow_empty=True)
+POSTGRES_HOST = required_env("POSTGRES_HOST")
+POSTGRES_PORT = int(required_env("POSTGRES_PORT"))
+POSTGRES_DB = required_env("POSTGRES_DB")
+POSTGRES_USER = required_env("POSTGRES_USER")
+POSTGRES_PASSWORD = required_env("POSTGRES_PASSWORD", allow_empty=True)
+POSTGRES_DSN = required_env("POSTGRES_DSN", allow_empty=True)
+PROMETHEUS_URL = required_env("PROMETHEUS_URL").rstrip("/")
+LITELLM_URL = required_env("LITELLM_URL").rstrip("/")
+LITELLM_API_KEY = required_env("LITELLM_MASTER_KEY")
+PORT = int(required_env("BENCHMARK_PORT"))
+HOST = required_env("BENCHMARK_HOST")
+MAX_WORKERS = max(1, int(required_env("BENCHMARK_MAX_WORKERS")))
+RESPONSE_READ_TIMEOUT = max(1.0, float(required_env("BENCHMARK_RESPONSE_READ_TIMEOUT")))
+PROMETHEUS_METRIC = required_env("LITELLM_PROMETHEUS_METRIC")
+PROMETHEUS_QUERY_TEMPLATE = required_env("LITELLM_PROMETHEUS_QUERY_TEMPLATE")
+PROMETHEUS_STEP = required_env("LITELLM_PROMETHEUS_STEP")
 logger = logging.getLogger(__name__)
 
 jobs: dict[str, Job] = {}
@@ -435,6 +447,34 @@ def query_models() -> list[str]:
     return sorted(models)
 
 
+def query_spendlog_time_range() -> dict[str, Any]:
+    """Return exact available time bounds and row count from the SpendLogs table."""
+    connection = None
+    try:
+        connection = postgres_connect()
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT MIN("startTime"), MAX("startTime"), COUNT(*) FROM "LiteLLM_SpendLogs"')
+            minimum, maximum, count = cursor.fetchone()
+        if minimum is None:
+            raise RuntimeError('LiteLLM_SpendLogs contains no timestamped rows')
+        return {
+            "min": minimum.replace(tzinfo=timezone.utc).timestamp(),
+            "max": maximum.replace(tzinfo=timezone.utc).timestamp(),
+            "count": count,
+            "source": "postgres",
+        }
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f'Failed to query LiteLLM_SpendLogs time range ({type(exc).__name__})') from exc
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 def query_target_models() -> list[str]:
     if not LITELLM_API_KEY:
         raise RuntimeError("LITELLM_MASTER_KEY is not configured; cannot query LiteLLM models")
@@ -458,13 +498,13 @@ def prom_query_range(
     model: str,
     start: datetime,
     end: datetime,
-    step: str = "15s",
+    step: str,
 ) -> dict[str, Any]:
-    metric = os.environ.get("LITELLM_PROMETHEUS_METRIC", "litellm_requests_metric")
+    metric = PROMETHEUS_METRIC
     if not metric.replace("_", "").isalnum():
         raise ValueError("LITELLM_PROMETHEUS_METRIC must be a Prometheus metric identifier")
     escaped = model.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    template = os.environ.get("LITELLM_PROMETHEUS_QUERY_TEMPLATE") or 'sum(rate({metric}{{model="{model}"}}[1m]))'
+    template = PROMETHEUS_QUERY_TEMPLATE
     query = template.format(metric=metric, model=escaped)
     params = "query=" + quote(query) + "&start=" + quote(str(start.timestamp())) + "&end=" + quote(str(end.timestamp())) + "&step=" + quote(step)
     req = Request(f"{PROMETHEUS_URL}/api/v1/query_range?{params}")
@@ -834,6 +874,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/models":
                 self.send_json(200, {"source_models": query_models(), "target_models": query_target_models()})
+            elif parsed.path == "/api/time-range":
+                self.send_json(200, query_spendlog_time_range())
             elif parsed.path == "/api/preview":
                 model = params.get("model", [""])[0]
                 start, end = parse_time(params.get("start", [""])[0]), parse_time(params.get("end", [""])[0])
@@ -851,7 +893,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/series":
                 model = params.get("model", [""])[0]
                 start, end = parse_time(params.get("start", [""])[0]), parse_time(params.get("end", [""])[0])
-                self.send_json(200, prom_query_range(model, start, end))
+                self.send_json(200, prom_query_range(model, start, end, PROMETHEUS_STEP))
             elif parsed.path.startswith("/api/replays/") or parsed.path.startswith("/api/runs/"):
                 run_id = parsed.path.rsplit("/", 1)[-1]
                 with jobs_lock:
