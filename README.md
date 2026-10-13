@@ -60,7 +60,7 @@ API 默认仅绑定服务器 `127.0.0.1:8088`。远程访问可使用 SSH 隧道
 
 ### Python 直接启动
 
-适用于已有 Python 3.10 或更高版本的环境。正常联网安装时，可以直接使用 pip 安装依赖。服务器无法联网时，可使用仓库 GitHub Release 中的 `psycopg-linux-aarch64-cp310.zip` 离线 wheel 包；此包适用于 Linux ARM64、CPython 3.10，无需创建虚拟环境。
+适用于已有 Python 3.10 或更高版本的环境。正常联网安装时，可以直接使用 pip 安装依赖。服务器无法联网时，可下载仓库中的 `psycopg-linux-aarch64-cp310.tar.gz` 离线 wheel 包；此包适用于 Linux ARM64、CPython 3.10，无需创建虚拟环境。
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -80,10 +80,11 @@ python3 app.py
 
 #### Linux ARM64 / Python 3.10 离线安装（系统 Python，无虚拟环境）
 
-从 GitHub Release 下载并解压 `psycopg-linux-aarch64-cp310.zip`，或通过其他文件传输方式将压缩包放到服务器。进入解压目录后，用系统 Python 安装到当前解释器：
+从 GitHub 下载 `psycopg-linux-aarch64-cp310.tar.gz`，或通过其他文件传输方式将压缩包放到服务器。解压后，用系统 Python 安装到当前解释器：
 
 ```bash
-unzip psycopg-linux-aarch64-cp310.zip -d psycopg-wheels
+mkdir -p psycopg-wheels
+tar -xzf psycopg-linux-aarch64-cp310.tar.gz -C psycopg-wheels
 python3 -m pip install --no-index --find-links=./psycopg-wheels --user 'psycopg[binary]==3.2.13'
 python3 -c 'import psycopg; print(psycopg.__version__)'
 ```
