@@ -44,7 +44,6 @@ POSTGRES_DB = required_env("POSTGRES_DB")
 POSTGRES_USER = required_env("POSTGRES_USER")
 POSTGRES_PASSWORD = required_env("POSTGRES_PASSWORD", allow_empty=True)
 POSTGRES_DSN = required_env("POSTGRES_DSN", allow_empty=True)
-PROMETHEUS_URL = required_env("PROMETHEUS_URL").rstrip("/")
 LITELLM_URL = required_env("LITELLM_URL").rstrip("/")
 LITELLM_API_KEY = required_env("LITELLM_MASTER_KEY")
 BENCHMARK_API_KEY = required_env("BENCHMARK_API_KEY")
@@ -52,9 +51,6 @@ PORT = int(required_env("BENCHMARK_PORT"))
 HOST = required_env("BENCHMARK_HOST")
 MAX_WORKERS = max(1, int(required_env("BENCHMARK_MAX_WORKERS")))
 RESPONSE_READ_TIMEOUT = max(1.0, float(required_env("BENCHMARK_RESPONSE_READ_TIMEOUT")))
-PROMETHEUS_METRIC = required_env("LITELLM_PROMETHEUS_METRIC")
-PROMETHEUS_QUERY_TEMPLATE = required_env("LITELLM_PROMETHEUS_QUERY_TEMPLATE")
-PROMETHEUS_STEP = required_env("LITELLM_PROMETHEUS_STEP")
 STATE_DB_PATH = os.path.abspath(os.path.expanduser(required_env("BENCHMARK_STATE_DB")))
 logger = logging.getLogger(__name__)
 
@@ -633,20 +629,30 @@ def query_target_models() -> list[str]:
     return sorted({str(item["id"]) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")})
 
 
-def prom_query_range(
-    model: str,
-    start: datetime,
-    end: datetime,
-    step: str,
-) -> dict[str, Any]:
-    metric = PROMETHEUS_METRIC
+class PrometheusConfigurationError(RuntimeError):
+    """Raised when the optional Prometheus endpoint is used without config."""
+
+
+def prometheus_setting(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise PrometheusConfigurationError(
+            f"Prometheus endpoint is not configured: {name} is missing"
+        )
+    return value
+
+
+def prom_query_range(model: str, start: datetime, end: datetime) -> dict[str, Any]:
+    prometheus_url = prometheus_setting("PROMETHEUS_URL").rstrip("/")
+    metric = prometheus_setting("LITELLM_PROMETHEUS_METRIC")
     if not metric.replace("_", "").isalnum():
         raise ValueError("LITELLM_PROMETHEUS_METRIC must be a Prometheus metric identifier")
     escaped = model.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    template = PROMETHEUS_QUERY_TEMPLATE
+    template = prometheus_setting("LITELLM_PROMETHEUS_QUERY_TEMPLATE")
+    step = prometheus_setting("LITELLM_PROMETHEUS_STEP")
     query = template.format(metric=metric, model=escaped)
     params = "query=" + quote(query) + "&start=" + quote(str(start.timestamp())) + "&end=" + quote(str(end.timestamp())) + "&step=" + quote(step)
-    req = Request(f"{PROMETHEUS_URL}/api/v1/query_range?{params}")
+    req = Request(f"{prometheus_url}/api/v1/query_range?{params}")
     with urlopen(req, timeout=10) as response:
         result = json.loads(response.read())
     if result.get("status") != "success":

@@ -14,8 +14,8 @@ from urllib.parse import parse_qs, urlparse
 
 from .core import (
     BENCHMARK_API_KEY,
-    PROMETHEUS_STEP,
     Job,
+    PrometheusConfigurationError,
     cancel_events,
     extract_body,
     jobs,
@@ -166,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/series":
                 model = params.get("model", [""])[0]
                 start, end = parse_time(params.get("start", [""])[0]), parse_time(params.get("end", [""])[0])
-                self.send_json(200, prom_query_range(model, start, end, PROMETHEUS_STEP))
+                self.send_json(200, prom_query_range(model, start, end))
             elif parsed.path.startswith("/api/replays/") or parsed.path.startswith("/api/runs/"):
                 run_id = parsed.path.rsplit("/", 1)[-1]
                 with jobs_lock:
@@ -175,6 +175,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, self.public_job(snapshot)) if snapshot is not None else self.send_json(404, {"error": "replay not found"})
             else:
                 self.send_json(404, {"error": "not found"})
+        except PrometheusConfigurationError as exc:
+            self.send_json(503, {"error": str(exc)})
         except (ValueError, RuntimeError, URLError, OSError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": str(exc)})
 

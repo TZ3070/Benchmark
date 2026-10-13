@@ -90,7 +90,7 @@ set +a
 PYTHONPATH=app python3 -m benchmark.app
 ```
 
-`.env` 使用 shell 兼容的 `KEY=value` 格式。后端不设运行配置默认值，所有表格中的变量都必须写入 `.env`；仅当变量用途不需要时，才可将注明可留空的变量显式设为空值。脚本默认读取项目根目录的 `.env`；也可以通过 `BENCHMARK_ENV_FILE=/path/to/env ./run.sh` 指定其他文件。不要把含密钥的 `.env` 上传到 GitHub。
+`.env` 使用 shell 兼容的 `KEY=value` 格式。后端不设运行配置默认值，表格中标为“必填”的变量必须写入 `.env`；标为可选的 Prometheus 配置仅在使用 `/api/series` 时需要。可留空的变量仍需显式设为空值。脚本默认读取项目根目录的 `.env`；也可以通过 `BENCHMARK_ENV_FILE=/path/to/env ./run.sh` 指定其他文件。不要把含密钥的 `.env` 上传到 GitHub。
 
 `app/requirements.txt` 只是依赖清单，不含打包 wheel。需要安装依赖时，在项目根目录执行：
 
@@ -115,13 +115,13 @@ python3 -c 'import psycopg; print(psycopg.__version__)'
 | `POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD` | Postgres 数据库凭证；密码可为空 | 必填，密码可留空 |
 | `SPENDLOGS_JSONL` | JSONL 文件或归档目录 | 必填 |
 | `SPENDLOGS_MANIFEST` | 可选的 JSONL 文件清单路径 | 必填，可留空 |
-| `PROMETHEUS_URL` | `/api/series` 查询地址 | 必填 |
+| `PROMETHEUS_URL` | `/api/series` 查询地址 | 可选，仅调用 `/api/series` 时必填 |
 | `BENCHMARK_PORT`、`BENCHMARK_HOST` | HTTP API 监听端口和地址 | 必填 |
 | `BENCHMARK_MAX_WORKERS` | 最大并发请求数 | 必填 |
 | `BENCHMARK_RESPONSE_READ_TIMEOUT` | 请求响应读取超时秒数；流式响应持续读取至结束 | 必填 |
-| `LITELLM_PROMETHEUS_METRIC` | Prometheus 指标名称 | 必填 |
-| `LITELLM_PROMETHEUS_QUERY_TEMPLATE` | PromQL 模板，支持 `{metric}`、`{model}` | 必填 |
-| `LITELLM_PROMETHEUS_STEP` | Prometheus 查询步长，例如 `15s` | 必填 |
+| `LITELLM_PROMETHEUS_METRIC` | Prometheus 指标名称 | 可选，仅调用 `/api/series` 时必填 |
+| `LITELLM_PROMETHEUS_QUERY_TEMPLATE` | PromQL 模板，支持 `{metric}`、`{model}` | 可选，仅调用 `/api/series` 时必填 |
+| `LITELLM_PROMETHEUS_STEP` | Prometheus 查询步长，例如 `15s` | 可选，仅调用 `/api/series` 时必填 |
 | `BENCHMARK_STATE_DB` | SQLite 任务及幂等记录文件 | 必填 |
 | `BENCHMARK_STATE_HOST` | Docker Compose 持久化目录 | Docker 启动必填 |
 | `SPENDLOGS_ARCHIVE_HOST` | Docker Compose 挂载的 JSONL 归档目录 | Docker 启动必填 |
