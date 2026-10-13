@@ -4,6 +4,7 @@
 *.jsonl
 *.manifest.json
 data/spendlogs/
+data/benchmark-state/
 __pycache__/
 *.py[cod]
 .DS_Store

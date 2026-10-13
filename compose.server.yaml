@@ -12,6 +12,7 @@ services:
       # The container listens on all interfaces; published host port stays loopback-only.
       BENCHMARK_HOST: "0.0.0.0"
       BENCHMARK_PORT: "8088"
+      BENCHMARK_API_KEY: ${BENCHMARK_API_KEY:?set BENCHMARK_API_KEY in .env}
       LITELLM_URL: ${LITELLM_URL:-http://host.docker.internal:4000}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
       POSTGRES_HOST: ${POSTGRES_HOST:-host.docker.internal}
@@ -28,6 +29,9 @@ services:
       LITELLM_PROMETHEUS_STEP: ${LITELLM_PROMETHEUS_STEP:-15s}
       BENCHMARK_MAX_WORKERS: ${BENCHMARK_MAX_WORKERS:-128}
       BENCHMARK_RESPONSE_READ_TIMEOUT: ${BENCHMARK_RESPONSE_READ_TIMEOUT:-600}
+      BENCHMARK_STATE_DB: /data/state/benchmark.sqlite3
     volumes:
       # Historical SpendLogs snapshots are read-only input to replay.
       - ${SPENDLOGS_ARCHIVE_HOST:-./data/spendlogs}:/data/spendlogs:ro
+      # Task and idempotency records survive container rebuilds/restarts.
+      - ${BENCHMARK_STATE_HOST:?set BENCHMARK_STATE_HOST in .env}:/data/state

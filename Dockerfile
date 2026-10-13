@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
+COPY benchmark ./benchmark
 # Port 8088 is the API port; configure the published host port in Compose.
 EXPOSE 8088
 CMD ["python", "app.py"]
