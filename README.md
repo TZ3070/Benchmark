@@ -144,8 +144,8 @@ Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只�
 以下仅定义前端接入要求；本仓库不包含前端代码。
 
 1. 页面加载时带 `Authorization: Bearer <BENCHMARK_API_KEY>` 请求 `GET /api/replays/active`。若 `active` 为 `true`，用 `task.replay_id` 恢复当前任务并继续轮询 `GET /api/replays/{id}`。
-2. 创建回放时继续发送 `Idempotency-Key`。若收到 `409` 且响应含 `active_task`，接管该任务并展示状态，不要再次创建任务。
-3. 轮询状态时读取 `progress.ready`、`progress.total`、`progress.sent`、`progress.completed`、`progress.sent_percent` 和 `progress.percent`。`ready=false` 时显示正在准备；就绪后显示总请求数和发送/完成进度。也可展示 `selected_count` 与 `skipped_count`。
+2. 在创建回放前提供回放倍数选择：`0.5×`、`1×`、`2×`、`5×`、`10×`，默认 `1×`。将所选数值作为 `POST /api/replays` 请求体中的 `speed`（例如 `0.5`、`1`、`2`、`5`、`10`）发送；`1×` 按原始相对时间间隔回放，倍数越大请求间隔越短。继续发送 `Idempotency-Key`，并将 `speed` 纳入创建请求签名；若收到 `409` 且响应含 `active_task`，接管该任务并展示状态，不要再次创建任务。
+3. 轮询状态时读取 `progress.ready`、`progress.total`、`progress.sent`、`progress.completed`、`progress.sent_percent` 和 `progress.percent`。`ready=false` 时显示正在准备；就绪后显示总请求数和发送/完成进度。也可展示 `selected_count` 与 `skipped_count`。在第一条请求发出前，后端已完成筛选和请求准备，`request_count` 与 `progress.total` 会返回可回放总数；若图表尚未有指标数据，前端应在图表占位区显示该总数，而不是只显示“等待实际打流开始时间”。
 4. 活动任务显示“取消”按钮，仅在 `cancellable=true` 时启用。点击后带相同认证头调用 `POST /api/replays/{id}/cancel`，接受 `202` 后继续轮询，直到 `cancelled` 等终态；不要在 `cancelling` 时立即清除任务。
 5. 取消会阻止后续尚未按计划提交的请求。已提交给请求工作线程的请求无法撤回，仍可能完成；因此 `cancelling` 到 `cancelled` 之间可能有延迟，期间计数仍会变化。
 

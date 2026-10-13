@@ -7,7 +7,6 @@ import re
 import sqlite3
 import threading
 import time
-import uuid
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -62,7 +61,6 @@ logger = logging.getLogger(__name__)
 jobs: dict[str, Job] = {}
 cancel_events: dict[str, threading.Event] = {}
 jobs_lock = threading.Lock()
-active_runs = False
 
 
 def open_state_db() -> sqlite3.Connection:
@@ -86,7 +84,6 @@ def save_job(job: Job) -> None:
 
 def initialize_state_db() -> None:
     """Create the durable task/idempotency store and recover interrupted runs."""
-    global active_runs
     with closing(open_state_db()) as connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS replay_jobs ("
@@ -111,12 +108,10 @@ def initialize_state_db() -> None:
             jobs[row["run_id"]] = job
         connection.commit()
     os.chmod(STATE_DB_PATH, 0o600)
-    active_runs = False
 
 
 def register_job(job: Job, idempotency_key: str, request_fingerprint: str) -> tuple[str, Job | None]:
     """Atomically return a duplicate, reject an active run, or persist a new run."""
-    global active_runs
     with jobs_lock:
         connection = open_state_db()
         try:
@@ -139,7 +134,6 @@ def register_job(job: Job, idempotency_key: str, request_fingerprint: str) -> tu
             ).fetchone()
             if active is not None:
                 connection.commit()
-                active_runs = True
                 active_job = json.loads(active["job_json"])
                 jobs[active["run_id"]] = active_job
                 return "active", active_job
@@ -156,7 +150,6 @@ def register_job(job: Job, idempotency_key: str, request_fingerprint: str) -> tu
             )
             connection.commit()
             jobs[job["run_id"]] = job
-            active_runs = True
             return "created", job
         except Exception:
             connection.rollback()
@@ -662,14 +655,11 @@ def prom_query_range(
 
 
 def update_job(run_id: str, **values: Any) -> None:
-    global active_runs
     with jobs_lock:
         job = jobs.get(run_id)
         if job is not None:
             job.update(values)
             save_job(job)
-            if values.get("status") in ("succeeded", "failed", "cancelled"):
-                active_runs = False
 
 
 def increment_sent(run_id: str) -> None:
