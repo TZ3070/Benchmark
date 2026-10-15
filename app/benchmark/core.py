@@ -8,11 +8,10 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -629,37 +628,6 @@ def query_target_models() -> list[str]:
     return sorted({str(item["id"]) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")})
 
 
-class PrometheusConfigurationError(RuntimeError):
-    """Raised when the optional Prometheus endpoint is used without config."""
-
-
-def prometheus_setting(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise PrometheusConfigurationError(
-            f"Prometheus endpoint is not configured: {name} is missing"
-        )
-    return value
-
-
-def prom_query_range(model: str, start: datetime, end: datetime) -> dict[str, Any]:
-    prometheus_url = prometheus_setting("PROMETHEUS_URL").rstrip("/")
-    metric = prometheus_setting("LITELLM_PROMETHEUS_METRIC")
-    if not metric.replace("_", "").isalnum():
-        raise ValueError("LITELLM_PROMETHEUS_METRIC must be a Prometheus metric identifier")
-    escaped = model.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    template = prometheus_setting("LITELLM_PROMETHEUS_QUERY_TEMPLATE")
-    step = prometheus_setting("LITELLM_PROMETHEUS_STEP")
-    query = template.format(metric=metric, model=escaped)
-    params = "query=" + quote(query) + "&start=" + quote(str(start.timestamp())) + "&end=" + quote(str(end.timestamp())) + "&step=" + quote(step)
-    req = Request(f"{prometheus_url}/api/v1/query_range?{params}")
-    with urlopen(req, timeout=10) as response:
-        result = json.loads(response.read())
-    if result.get("status") != "success":
-        raise RuntimeError("Prometheus range query failed")
-    return result["data"]
-
-
 def update_job(run_id: str, **values: Any) -> None:
     with jobs_lock:
         job = jobs.get(run_id)
@@ -809,6 +777,7 @@ def run_replay(
     target_model: str,
     prepared: list[ReplayRequest],
     speed: float,
+    dispatch_mode: str = "scheduled",
 ) -> None:
     try:
         if not prepared:
@@ -887,46 +856,91 @@ def run_replay(
             append_result(run_id, result)
             return result
 
-        executor = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(prepared)))
+        worker_count = min(MAX_WORKERS, len(prepared))
+        executor = ThreadPoolExecutor(max_workers=worker_count)
         futures = []
         dispatch_started = False
         dispatch_epoch = None
+
+        def submit_request(
+            record: SpendLogRecord,
+            body: RequestBody,
+            endpoint: str,
+            planned: datetime,
+        ) -> Any:
+            increment_sent(run_id)
+            future = executor.submit(send_one, record, body, endpoint, planned)
+            update_job(run_id, last_scheduled_at=planned.timestamp())
+            return future
+
+        def record_future_error(future: Any, errors: list[str]) -> None:
+            try:
+                result = future.result()
+                if result.get("error") or (result.get("status_code") is not None and result["status_code"] >= 400):
+                    errors.append(result.get("error") or f"HTTP {result['status_code']}")
+            except Exception as exc:
+                errors.append(str(exc))
+                update_job(run_id, error_count=len(errors), last_error="Request worker failed")
+
         try:
-            for record, body, endpoint in prepared:
-                if cancel_event.is_set():
-                    break
-                offset = (record["_timestamp"] - first).total_seconds() / speed
-                delay = offset - (time.monotonic() - t0)
-                if delay > 0 and cancel_event.wait(delay):
-                    break
-                if cancel_event.is_set():
-                    break
-                if not dispatch_started:
-                    dispatch_started = True
-                    dispatch_epoch = time.time()
-                    update_job(
-                        run_id,
-                        status="running",
-                        started_at=dispatch_epoch,
-                    )
-                assert dispatch_epoch is not None
-                planned = datetime.fromtimestamp(dispatch_epoch + offset, timezone.utc)
-                increment_sent(run_id)
-                futures.append(executor.submit(send_one, record, body, endpoint, planned))
-                update_job(run_id, last_scheduled_at=planned.timestamp())
+            errors: list[str] = []
+            if dispatch_mode == "burst":
+                next_index = 0
+                in_flight = set()
+                while next_index < len(prepared) or in_flight:
+                    if cancel_event.is_set():
+                        break
+                    if not dispatch_started and next_index < len(prepared):
+                        dispatch_started = True
+                        dispatch_epoch = time.time()
+                        update_job(run_id, status="running", started_at=dispatch_epoch)
+                    while (
+                        not cancel_event.is_set()
+                        and next_index < len(prepared)
+                        and len(in_flight) < worker_count
+                    ):
+                        record, body, endpoint = prepared[next_index]
+                        planned = datetime.now(timezone.utc)
+                        in_flight.add(submit_request(record, body, endpoint, planned))
+                        next_index += 1
+                    if in_flight:
+                        completed, in_flight = wait(
+                            in_flight,
+                            timeout=0.1,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        for future in completed:
+                            record_future_error(future, errors)
+                # Wait for requests already in flight when cancellation arrives.
+                for future in in_flight:
+                    record_future_error(future, errors)
+            else:
+                for record, body, endpoint in prepared:
+                    if cancel_event.is_set():
+                        break
+                    offset = (record["_timestamp"] - first).total_seconds() / speed
+                    delay = offset - (time.monotonic() - t0)
+                    if delay > 0 and cancel_event.wait(delay):
+                        break
+                    if cancel_event.is_set():
+                        break
+                    if not dispatch_started:
+                        dispatch_started = True
+                        dispatch_epoch = time.time()
+                        update_job(
+                            run_id,
+                            status="running",
+                            started_at=dispatch_epoch,
+                        )
+                    assert dispatch_epoch is not None
+                    planned = datetime.fromtimestamp(dispatch_epoch + offset, timezone.utc)
+                    futures.append(submit_request(record, body, endpoint, planned))
             if not cancel_event.is_set():
                 update_job(run_id, status="draining", dispatch_finished=True)
             else:
                 update_job(run_id, dispatch_finished=True)
-            errors = []
             for future in futures:
-                try:
-                    result = future.result()
-                    if result.get("error") or (result.get("status_code") is not None and result["status_code"] >= 400):
-                        errors.append(result.get("error") or f"HTTP {result['status_code']}")
-                except Exception as exc:
-                    errors.append(str(exc))
-                    update_job(run_id, error_count=len(errors), last_error="Request worker failed")
+                record_future_error(future, errors)
             if cancel_event.is_set():
                 update_job(run_id, status="cancelled", finished_at=time.time())
             elif errors:
@@ -939,7 +953,15 @@ def run_replay(
         update_job(run_id, status="failed", error=str(exc), finished_at=time.time())
 
 
-def prepare_and_run(run_id: str, source_model: str, target_model: str, start: datetime, end: datetime, speed: float) -> None:
+def prepare_and_run(
+    run_id: str,
+    source_model: str,
+    target_model: str,
+    start: datetime,
+    end: datetime,
+    speed: float,
+    dispatch_mode: str = "scheduled",
+) -> None:
     """Load and merge all source records off the HTTP request thread."""
     try:
         if cancel_events[run_id].is_set():
@@ -986,6 +1008,6 @@ def prepare_and_run(run_id: str, source_model: str, target_model: str, start: da
                 return
             job.update(status="queued")
             save_job(job)
-        run_replay(run_id, target_model, prepared, speed)
+        run_replay(run_id, target_model, prepared, speed, dispatch_mode)
     except Exception as exc:
         update_job(run_id, status="failed", error=str(exc), finished_at=time.time())

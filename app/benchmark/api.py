@@ -15,7 +15,6 @@ from urllib.parse import parse_qs, urlparse
 from .core import (
     BENCHMARK_API_KEY,
     Job,
-    PrometheusConfigurationError,
     cancel_events,
     extract_body,
     jobs,
@@ -23,7 +22,6 @@ from .core import (
     parse_time,
     parse_unix_time,
     prepare_and_run,
-    prom_query_range,
     query_models,
     query_target_models,
     register_job,
@@ -92,6 +90,8 @@ class Handler(BaseHTTPRequestHandler):
             "model_id": job.get("target_model"),
             "source_model": job.get("source_model"),
             "target_model": job.get("target_model"),
+            "dispatch_mode": job.get("dispatch_mode", "scheduled"),
+            "speed": job.get("public_speed", job.get("speed", 1.0)),
             "start_time": job.get("start"),
             "end_time": job.get("end"),
             "created_at": job.get("created_at"),
@@ -135,7 +135,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"source_models": query_models(), "target_models": query_target_models()})
             elif parsed.path == "/api/time-range":
                 self.send_json(200, select_time_range())
-            elif parsed.path in {"/api/replays/active", "/api/runs/active"}:
+            elif parsed.path == "/api/replays/active":
                 with jobs_lock:
                     active_job = next(
                         (
@@ -163,11 +163,7 @@ class Handler(BaseHTTPRequestHandler):
                     "missing_payload_count": len(rows) - replayable,
                     "warnings": warnings,
                 })
-            elif parsed.path == "/api/series":
-                model = params.get("model", [""])[0]
-                start, end = parse_time(params.get("start", [""])[0]), parse_time(params.get("end", [""])[0])
-                self.send_json(200, prom_query_range(model, start, end))
-            elif parsed.path.startswith("/api/replays/") or parsed.path.startswith("/api/runs/"):
+            elif parsed.path.startswith("/api/replays/"):
                 run_id = parsed.path.rsplit("/", 1)[-1]
                 with jobs_lock:
                     job = jobs.get(run_id)
@@ -175,8 +171,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, self.public_job(snapshot)) if snapshot is not None else self.send_json(404, {"error": "replay not found"})
             else:
                 self.send_json(404, {"error": "not found"})
-        except PrometheusConfigurationError as exc:
-            self.send_json(503, {"error": str(exc)})
         except (ValueError, RuntimeError, URLError, OSError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": str(exc)})
 
@@ -185,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and self.api_path_requires_auth(path) and not self.api_authorized():
             return
         try:
-            if (path.startswith("/api/runs/") or path.startswith("/api/replays/")) and path.endswith("/cancel"):
+            if path.startswith("/api/replays/") and path.endswith("/cancel"):
                 run_id = path.split("/")[-2]
                 with jobs_lock:
                     job = jobs.get(run_id)
@@ -210,7 +204,7 @@ class Handler(BaseHTTPRequestHandler):
                     cancel_event.set()
                     snapshot = dict(job)
                 return self.send_json(202, self.public_job(snapshot))
-            if path not in ("/api/runs", "/api/replays"):
+            if path != "/api/replays":
                 return self.send_json(404, {"error": "not found"})
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > 1_000_000:
@@ -233,15 +227,30 @@ class Handler(BaseHTTPRequestHandler):
                 start = parse_unix_time(data["start_time"], "start_time")
                 end = parse_unix_time(data["end_time"], "end_time")
             else:
-                # Accept the earlier ISO-8601 /api/runs contract as a
-                # compatibility path; the current UI sends Unix seconds.
+                # Accept the earlier ISO-8601 start/end payload shape.
                 start, end = parse_time(data["start"]), parse_time(data["end"])
-            try:
-                speed = float(data.get("speed", 1.0))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("speed must be a number greater than 0") from exc
-            if not (speed > 0 and speed < float("inf")):
-                raise ValueError("speed must be a finite number greater than 0")
+            raw_speed = data.get("speed", 1.0)
+            requested_mode = str(data.get("dispatch_mode", "")).strip().lower()
+            speed_text = str(raw_speed).strip().lower()
+            if requested_mode not in {"", "scheduled", "burst"}:
+                raise ValueError("dispatch_mode must be 'scheduled' or 'burst'")
+            burst_requested = requested_mode == "burst" or speed_text in {"burst", "突发"}
+            if requested_mode == "scheduled" and speed_text in {"burst", "突发"}:
+                raise ValueError("speed 'burst' cannot be used with scheduled dispatch")
+            dispatch_mode = "burst" if burst_requested else "scheduled"
+            if dispatch_mode == "burst":
+                speed = 1.0
+                public_speed: float | str = "burst"
+            else:
+                if speed_text.startswith("*"):
+                    speed_text = speed_text[1:].strip()
+                try:
+                    speed = float(speed_text)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("speed must be a positive number, '*N', or 'burst'") from exc
+                if not (speed > 0 and speed < float("inf")):
+                    raise ValueError("speed must be a finite number greater than 0")
+                public_speed = speed
             if not source_model or not target_model or start >= end:
                 raise ValueError("A valid model and time range are required")
             idempotency_key = self.headers.get("Idempotency-Key", "").strip()
@@ -253,6 +262,7 @@ class Handler(BaseHTTPRequestHandler):
                     "target_model": target_model,
                     "start_time": start.timestamp(),
                     "end_time": end.timestamp(),
+                    "dispatch_mode": dispatch_mode,
                     "speed": speed,
                 },
                 sort_keys=True,
@@ -268,7 +278,9 @@ class Handler(BaseHTTPRequestHandler):
                 "created_at": time.time(),
                 "start": start.timestamp(),
                 "end": end.timestamp(),
+                "dispatch_mode": dispatch_mode,
                 "speed": speed,
+                "public_speed": public_speed,
                 "request_count": None,
                 "sent_count": 0,
                 "completed_count": 0,
@@ -296,7 +308,7 @@ class Handler(BaseHTTPRequestHandler):
             initial_response = self.public_job(dict(job))
             threading.Thread(
                 target=prepare_and_run,
-                args=(run_id, source_model, target_model, start, end, speed),
+                args=(run_id, source_model, target_model, start, end, speed, dispatch_mode),
                 daemon=True,
             ).start()
             self.send_json(202, initial_response)
