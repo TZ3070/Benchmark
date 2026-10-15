@@ -586,8 +586,12 @@ def query_models() -> list[str]:
     try:
         connection = postgres_connect()
         with connection.cursor() as cursor:
-            cursor.execute('SELECT DISTINCT "model" FROM "LiteLLM_SpendLogs" WHERE "model" IS NOT NULL')
-            models.update(str(row[0]) for row in cursor if row[0] is not None)
+            cursor.execute(
+                'SELECT DISTINCT "model" FROM "LiteLLM_SpendLogs" '
+                'WHERE "model" IS NOT NULL AND BTRIM("model") <> %s',
+                ("",),
+            )
+            models.update(str(row[0]).strip() for row in cursor if row[0] is not None and str(row[0]).strip())
     except Exception as exc:
         logger.warning(
             'Postgres model lookup failed; using JSONL models only (%s: %s)',
@@ -601,9 +605,9 @@ def query_models() -> list[str]:
             except Exception as exc:
                 logger.warning("Failed to close Postgres model connection (%s)", type(exc).__name__)
     models.update(
-        str(record["model"])
+        str(record["model"]).strip()
         for record in iter_records(allow_empty=True)
-        if record.get("model") is not None
+        if record.get("model") is not None and str(record["model"]).strip()
     )
     return sorted(models)
 
