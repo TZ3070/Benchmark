@@ -125,6 +125,16 @@ Docker Compose 用 `.env` 中的 `SPENDLOGS_ARCHIVE_HOST` 将服务器目录只�
 
 如需从现有 LiteLLM Postgres 导出 JSONL 快照，使用独立目录 [`spendlogs-export/`](spendlogs-export/README.md) 中的脚本。导出脚本不属于 API 启动依赖。
 
+## 日志与失败定位
+
+服务日志输出到标准错误流，前台运行时会显示在启动终端；systemd 可从 journal 查看，Docker 可用 `docker compose logs -f benchmark` 查看。Python 直接运行时可保存终端输出：
+
+```bash
+bash app/run.sh 2>&1 | tee -a benchmark.log
+```
+
+日志按事件记录服务启动、回放创建/准备阶段、每条失败请求的 request_id、目标模型、endpoint、HTTP 状态、耗时和脱敏后的异常详情；成功请求不逐条写日志，任务结束时汇总成功数、失败数、已发送数、已完成数和总耗时。不会记录 prompt、请求体或认证密钥。可用 `run_id` 关联同一任务的日志；前端创建失败但尚未收到 replay_id 时，先按时间查找 `event=replay_create_rejected`。逐请求失败查找 `event=replay_request_failed`，结合 `status_code`、`elapsed_seconds`、`error_kind` 和 `error_detail` 定位。
+
 ## HTTP API
 
 - `GET /api/models`：返回 JSONL 中的源模型和 LiteLLM 当前可用的目标模型。

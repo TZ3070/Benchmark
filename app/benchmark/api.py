@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -25,6 +26,7 @@ from .core import (
     query_models,
     query_target_models,
     register_job,
+    request_exception_detail,
     save_job,
     select_records,
     select_time_range,
@@ -32,6 +34,7 @@ from .core import (
 
 ACTIVE_STATUSES = {"preparing", "queued", "running", "draining", "cancelling"}
 CANCELLABLE_STATUSES = ACTIVE_STATUSES - {"cancelling"}
+logger = logging.getLogger(__name__)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,9 +57,11 @@ class Handler(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "")
         scheme, separator, credential = authorization.partition(" ")
         if not separator or scheme.lower() != "bearer" or not credential.strip():
+            logger.warning("event=api_auth_rejected method=%s path=%s reason=missing_bearer_token", self.command, urlparse(self.path).path)
             self.send_json(401, {"error": "Authorization bearer token is required"})
             return False
         if not hmac.compare_digest(credential.strip(), BENCHMARK_API_KEY):
+            logger.warning("event=api_auth_rejected method=%s path=%s reason=invalid_bearer_token", self.command, urlparse(self.path).path)
             self.send_json(401, {"error": "Invalid Benchmark API token"})
             return False
         return True
@@ -291,9 +296,14 @@ class Handler(BaseHTTPRequestHandler):
             }
             disposition, registered_job = register_job(job, idempotency_key, request_fingerprint)
             if disposition == "conflict":
+                logger.warning("event=replay_create_conflict reason=idempotency_key_reused")
                 self.send_json(409, {"error": "Idempotency-Key was already used with a different request"})
                 return
             if disposition == "active":
+                logger.warning(
+                    "event=replay_create_conflict reason=active_task active_run_id=%s",
+                    registered_job.get("run_id") if registered_job else None,
+                )
                 self.send_json(409, {
                     "error": "A replay task is already active; wait for it to finish before starting another",
                     "active_task": self.public_job(registered_job) if registered_job is not None else None,
@@ -311,10 +321,27 @@ class Handler(BaseHTTPRequestHandler):
                 args=(run_id, source_model, target_model, start, end, speed, dispatch_mode),
                 daemon=True,
             ).start()
+            logger.info(
+                "event=replay_create_accepted run_id=%s source_model=%r target_model=%r mode=%s speed=%s start=%s end=%s",
+                run_id,
+                source_model,
+                target_model,
+                dispatch_mode,
+                public_speed,
+                start.isoformat(),
+                end.isoformat(),
+            )
             self.send_json(202, initial_response)
         except KeyError as exc:
+            logger.warning("event=replay_create_rejected error_type=KeyError field=%r", exc.args[0] if exc.args else "")
             self.send_json(400, {"error": f"Missing required field: {exc.args[0]}"})
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            logger.error("event=replay_create_failed error_type=%s detail=%r", type(exc).__name__, request_exception_detail(exc))
             self.send_json(500, {"error": "Replay state storage is unavailable"})
         except (KeyError, ValueError, RuntimeError, json.JSONDecodeError, URLError, OSError) as exc:
+            logger.warning(
+                "event=replay_create_rejected error_type=%s detail=%r",
+                type(exc).__name__,
+                request_exception_detail(exc),
+            )
             self.send_json(400, {"error": str(exc)})

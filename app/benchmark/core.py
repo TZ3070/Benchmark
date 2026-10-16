@@ -419,6 +419,22 @@ def sanitize_upstream_error_body(raw: bytes) -> str:
     return text[:3000]
 
 
+def request_exception_detail(exc: Exception) -> str:
+    """Return bounded transport diagnostics while redacting configured secrets."""
+    if isinstance(exc, TimeoutError):
+        detail = "socket operation timed out"
+    elif isinstance(exc, URLError):
+        reason = exc.reason
+        detail = f"{type(reason).__name__}: {reason}"
+    else:
+        detail = str(exc).strip() or type(exc).__name__
+    for secret in (LITELLM_API_KEY, POSTGRES_PASSWORD, BENCHMARK_API_KEY, POSTGRES_DSN):
+        if secret:
+            detail = detail.replace(secret, "[REDACTED]")
+    detail = re.sub(r"(?i)\bBearer\s+[^\s]+", "Bearer [REDACTED]", detail)
+    return detail.replace("\n", " ")[:300]
+
+
 def read_postgres_records(model: str, start: datetime, end: datetime) -> list[SpendLogRecord]:
     """Fetch complete SpendLogs rows in the requested half-open interval."""
     connection = None
@@ -793,6 +809,15 @@ def run_replay(
         t0 = time.monotonic()
         first = prepared[0][0]["_timestamp"]
         update_job(run_id, request_count=len(prepared))
+        logger.info(
+            "event=replay_dispatch_started run_id=%s target_model=%r mode=%s request_count=%d max_in_flight=%d timeout_seconds=%s",
+            run_id,
+            target_model,
+            dispatch_mode,
+            len(prepared),
+            min(MAX_WORKERS, len(prepared)),
+            RESPONSE_READ_TIMEOUT,
+        )
         if cancel_event.is_set():
             update_job(run_id, status="cancelled", finished_at=time.time())
             return
@@ -808,6 +833,8 @@ def run_replay(
             input_tokens = output_tokens = None
             output_text = ""
             error_text = None
+            error_kind = None
+            error_detail = None
             try:
                 request_body = dict(body)
                 request_body["model"] = target_model
@@ -835,8 +862,12 @@ def run_replay(
                     )
                     if stream_error:
                         error_text = stream_error
+                        error_kind = "upstream_stream_error"
+                        error_detail = "provider reported an error in the response stream"
             except HTTPError as exc:
                 status_code = exc.code
+                error_kind = "upstream_http_error"
+                error_detail = f"upstream returned HTTP {exc.code}"
                 try:
                     error_body = exc.read(64 * 1024)
                     detail = sanitize_upstream_error_body(error_body)
@@ -846,7 +877,9 @@ def run_replay(
                 except Exception:
                     error_text = f"Upstream returned HTTP {exc.code}"
             except Exception as exc:
-                error_text = f"{type(exc).__name__}: Request failed"
+                error_kind = type(exc).__name__
+                error_detail = request_exception_detail(exc)
+                error_text = f"{error_kind}: {error_detail}"
             result = {
                 "request_id": record.get("request_id"),
                 "elapsed_seconds": round(time.monotonic() - started, 6),
@@ -858,6 +891,19 @@ def run_replay(
             if error_text:
                 result["error"] = error_text
             append_result(run_id, result)
+            failed = bool(error_text) or (status_code is not None and status_code >= 400)
+            if failed:
+                logger.error(
+                    "event=replay_request_failed run_id=%s request_id=%r target_model=%r endpoint=%s status_code=%s elapsed_seconds=%.6f error_kind=%s error_detail=%r",
+                    run_id,
+                    record.get("request_id"),
+                    target_model,
+                    endpoint,
+                    status_code,
+                    result["elapsed_seconds"],
+                    error_kind,
+                    error_detail,
+                )
             return result
 
         worker_count = min(MAX_WORKERS, len(prepared))
@@ -883,7 +929,14 @@ def run_replay(
                 if result.get("error") or (result.get("status_code") is not None and result["status_code"] >= 400):
                     errors.append(result.get("error") or f"HTTP {result['status_code']}")
             except Exception as exc:
-                errors.append(str(exc))
+                detail = request_exception_detail(exc)
+                errors.append(f"{type(exc).__name__}: {detail}")
+                logger.error(
+                    "event=replay_worker_failed run_id=%s error_type=%s detail=%r",
+                    run_id,
+                    type(exc).__name__,
+                    detail,
+                )
                 update_job(run_id, error_count=len(errors), last_error="Request worker failed")
 
         try:
@@ -946,15 +999,49 @@ def run_replay(
             for future in futures:
                 record_future_error(future, errors)
             if cancel_event.is_set():
-                update_job(run_id, status="cancelled", finished_at=time.time())
+                final_status = "cancelled"
+                update_job(run_id, status=final_status, finished_at=time.time())
             elif errors:
-                update_job(run_id, status="failed", error=f"{len(errors)} request(s) failed", finished_at=time.time())
+                final_status = "failed"
+                update_job(run_id, status=final_status, error=f"{len(errors)} request(s) failed", finished_at=time.time())
             else:
-                update_job(run_id, status="succeeded", finished_at=time.time())
+                final_status = "succeeded"
+                update_job(run_id, status=final_status, finished_at=time.time())
+            with jobs_lock:
+                finished_job = jobs.get(run_id, {})
+                sent_count = int(finished_job.get("sent_count", 0))
+                completed_count = int(finished_job.get("completed_count", 0))
+                request_results = list(finished_job.get("results", []))
+            succeeded_count = sum(
+                1 for item in request_results
+                if not item.get("error") and (item.get("status_code") is None or item["status_code"] < 400)
+            )
+            failed_count = sum(
+                1 for item in request_results
+                if item.get("error") or (item.get("status_code") is not None and item["status_code"] >= 400)
+            )
+            elapsed_seconds = round(time.monotonic() - t0, 6)
+            logger.info(
+                "event=replay_dispatch_finished run_id=%s status=%s sent_count=%d completed_count=%d succeeded_count=%d failed_count=%d elapsed_seconds=%.6f",
+                run_id,
+                final_status,
+                sent_count,
+                completed_count,
+                succeeded_count,
+                failed_count,
+                elapsed_seconds,
+            )
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
     except Exception as exc:
-        update_job(run_id, status="failed", error=str(exc), finished_at=time.time())
+        detail = request_exception_detail(exc)
+        logger.error(
+            "event=replay_dispatch_crashed run_id=%s error_type=%s detail=%r",
+            run_id,
+            type(exc).__name__,
+            detail,
+        )
+        update_job(run_id, status="failed", error=f"{type(exc).__name__}: {detail}", finished_at=time.time())
 
 
 def prepare_and_run(
@@ -972,8 +1059,21 @@ def prepare_and_run(
             update_job(run_id, status="cancelled", finished_at=time.time())
             return
         diagnostics: list[str] = []
+        logger.info(
+            "event=replay_preparation_started run_id=%s source_model=%r start=%s end=%s",
+            run_id,
+            source_model,
+            start.isoformat(),
+            end.isoformat(),
+        )
         records = select_records(source_model, start, end, diagnostics)
         update_job(run_id, selected_count=len(records), warnings=diagnostics)
+        logger.info(
+            "event=replay_records_selected run_id=%s selected_count=%d warning_count=%d",
+            run_id,
+            len(records),
+            len(diagnostics),
+        )
         if cancel_events[run_id].is_set():
             update_job(run_id, status="cancelled", finished_at=time.time())
             return
@@ -997,6 +1097,12 @@ def prepare_and_run(
             total=len(prepared),
             preparation_phase="complete",
         )
+        logger.info(
+            "event=replay_preparation_finished run_id=%s replayable_count=%d skipped_count=%d",
+            run_id,
+            len(prepared),
+            skipped_count,
+        )
         if cancel_events[run_id].is_set():
             update_job(run_id, status="cancelled", finished_at=time.time())
             return
@@ -1014,4 +1120,11 @@ def prepare_and_run(
             save_job(job)
         run_replay(run_id, target_model, prepared, speed, dispatch_mode)
     except Exception as exc:
-        update_job(run_id, status="failed", error=str(exc), finished_at=time.time())
+        detail = request_exception_detail(exc)
+        logger.error(
+            "event=replay_preparation_failed run_id=%s error_type=%s detail=%r",
+            run_id,
+            type(exc).__name__,
+            detail,
+        )
+        update_job(run_id, status="failed", error=f"{type(exc).__name__}: {detail}", finished_at=time.time())
