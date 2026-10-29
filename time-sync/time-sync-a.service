@@ -1,0 +1,16 @@
+[Unit]
+Description=Submit server A time to server B
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=timesync-a
+ExecStart=/usr/bin/python3 /opt/traffic-time-sync/sync_from_a.py --host timesync-b --remote-command "sudo -n /usr/bin/python3 /opt/traffic-time-sync/receive_on_b.py --chronyc /usr/bin/chronyc --socket /run/chrony/chronyd.sock" --apply
+TimeoutStartSec=60
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectClock=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
